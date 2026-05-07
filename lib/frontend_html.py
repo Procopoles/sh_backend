@@ -4,7 +4,7 @@ FRONTEND_HTML = """
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Score API - Gestao Manual e Automatica</title>
+  <title>Score API - Gestao Manual de Areas</title>
   <link
     rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -28,6 +28,7 @@ FRONTEND_HTML = """
       --radius: 18px;
     }
     * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
     body {
       margin: 0;
       color: var(--text);
@@ -51,9 +52,11 @@ FRONTEND_HTML = """
     }
     .hero {
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: minmax(320px, 0.8fr) minmax(460px, 1.2fr);
       gap: 16px;
       margin-bottom: 16px;
+      align-items: stretch;
+      transition: grid-template-columns 0.28s ease;
     }
     .hero-card {
       display: flex;
@@ -99,32 +102,6 @@ FRONTEND_HTML = """
       font-size: 22px;
       margin-top: 4px;
     }
-    .tab-bar {
-      display: inline-flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      padding: 6px;
-      border-radius: 999px;
-      background: rgba(16, 36, 61, 0.06);
-      border: 1px solid rgba(16, 36, 61, 0.05);
-      align-self: flex-start;
-    }
-    .tab-btn {
-      border: 0;
-      border-radius: 999px;
-      padding: 11px 16px;
-      cursor: pointer;
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--subtle);
-      background: transparent;
-      transition: 0.2s ease;
-    }
-    .tab-btn.active {
-      color: #fff;
-      background: linear-gradient(135deg, var(--primary), var(--primary-strong));
-      box-shadow: 0 8px 20px rgba(11, 114, 133, 0.22);
-    }
     .hero-note {
       padding: 12px 14px;
       border-radius: 14px;
@@ -133,6 +110,21 @@ FRONTEND_HTML = """
       font-size: 14px;
       color: var(--subtle);
     }
+    .map-panel {
+      transition: transform 0.24s ease, box-shadow 0.24s ease;
+    }
+    .map-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .map-expanded .hero {
+      grid-template-columns: 1fr;
+    }
+    .map-expanded .map-panel {
+      grid-column: 1 / -1;
+    }
     #map {
       width: 100%;
       height: 62vh;
@@ -140,6 +132,11 @@ FRONTEND_HTML = """
       border-radius: 16px;
       border: 1px solid var(--border);
       overflow: hidden;
+      transition: height 0.32s ease, min-height 0.32s ease;
+    }
+    .map-expanded #map {
+      height: min(78vh, 860px);
+      min-height: 560px;
     }
     .grid {
       display: grid;
@@ -179,10 +176,6 @@ FRONTEND_HTML = """
     .badge.manual {
       background: rgba(255, 159, 28, 0.14);
       color: #965a00;
-    }
-    .badge.automatic {
-      background: rgba(11, 114, 133, 0.12);
-      color: var(--primary-strong);
     }
     table {
       width: 100%;
@@ -260,6 +253,10 @@ FRONTEND_HTML = """
       background: var(--danger);
       color: #fff;
     }
+    button.ghost {
+      background: #fff;
+      border: 1px solid var(--border);
+    }
     .form-panel {
       display: none;
       gap: 12px;
@@ -275,8 +272,39 @@ FRONTEND_HTML = """
     .form-grid.triple {
       grid-template-columns: 1fr 1fr 120px;
     }
+    .form-grid.identity {
+      grid-template-columns: minmax(0, 1.25fr) minmax(180px, 0.75fr);
+    }
+    .form-grid.meta {
+      grid-template-columns: minmax(0, 1fr) 148px 86px;
+      align-items: end;
+    }
     .form-grid.full {
       grid-template-columns: 1fr;
+    }
+    .form-section {
+      display: grid;
+      gap: 10px;
+      padding: 14px 0;
+      border-top: 1px solid var(--border);
+    }
+    .form-section:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+    .form-section-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .form-section-head strong {
+      display: block;
+      font-size: 14px;
+    }
+    .field-hint {
+      margin-top: 5px;
+      font-size: 12px;
+      color: var(--subtle);
     }
     label {
       display: block;
@@ -293,6 +321,32 @@ FRONTEND_HTML = """
       font-family: inherit;
       background: #fff;
       color: var(--text);
+    }
+    .icon-input {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0 10px;
+      background: #fff;
+    }
+    .icon-input span {
+      color: var(--accent);
+      font-size: 15px;
+      flex: 0 0 auto;
+    }
+    .icon-input input {
+      border: 0;
+      border-radius: 0;
+      padding: 9px 0;
+      text-align: center;
+      background: transparent;
+    }
+    .icon-input input:focus {
+      outline: 0;
     }
     .color-field {
       display: flex;
@@ -380,10 +434,18 @@ FRONTEND_HTML = """
         height: 50vh;
         min-height: 360px;
       }
+      .map-expanded #map {
+        height: 68vh;
+        min-height: 460px;
+      }
     }
     @media (max-width: 740px) {
       .container { padding: 14px; }
-      .form-grid { grid-template-columns: 1fr; }
+      .form-grid,
+      .form-grid.identity,
+      .form-grid.meta {
+        grid-template-columns: 1fr;
+      }
       .list-head,
       .editor-head {
         flex-direction: column;
@@ -392,6 +454,9 @@ FRONTEND_HTML = """
         display: grid;
         grid-template-columns: 1fr 1fr;
       }
+      .map-toolbar {
+        justify-content: flex-start;
+      }
       .row-actions button {
         flex: 1 1 120px;
       }
@@ -399,7 +464,7 @@ FRONTEND_HTML = """
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="container" id="app-shell">
     <section class="hero">
       <div class="panel hero-card">
         <div>
@@ -408,32 +473,28 @@ FRONTEND_HTML = """
             <h1>Gestao de Areas</h1>
           </div>
           <p class="muted" style="margin:8px 0 0;">
-            Organize, revise e atualize as areas do mapa em um unico painel.
+            Organize, revise e atualize manualmente as areas do mapa em um unico painel.
           </p>
-        </div>
-        <div class="tab-bar" id="mode-tabs">
-          <button class="tab-btn active" id="tab-manual" type="button">◫ Manual</button>
-          <button class="tab-btn" id="tab-automatic" type="button">◎ Automatico</button>
         </div>
         <div class="hero-metrics">
           <div class="metric">
-            <span class="mini">Areas visiveis</span>
+            <span class="mini">Areas no mapa</span>
             <strong id="metric-visible">0</strong>
           </div>
           <div class="metric">
-            <span class="mini">Total geral</span>
+            <span class="mini">Total manual</span>
             <strong id="metric-total">0</strong>
           </div>
           <div class="metric">
-            <span class="mini">Automaticas</span>
-            <strong id="metric-automatic">0</strong>
+            <span class="mini">Agencias</span>
+            <strong id="metric-agencies">0</strong>
           </div>
         </div>
         <div class="hero-note" id="mode-note">
-          Use o modo manual para ajustes diretos e o automatico para manter arquivos sincronizados.
+          Fluxo focado em cadastro manual: preencha os metadados, revise o desenho no mapa e salve.
         </div>
       </div>
-      <div class="panel">
+      <div class="panel map-panel">
         <div class="list-head" style="margin-bottom:12px;">
           <div>
             <div class="title-line">
@@ -442,7 +503,10 @@ FRONTEND_HTML = """
             </div>
             <div class="muted" id="map-meta">Carregando areas...</div>
           </div>
-          <span class="pill" id="auto-refresh-pill">↻ Atualizacao automatica</span>
+          <div class="map-toolbar">
+            <span class="pill" id="visible-filter-pill">Manual</span>
+            <button class="ghost" id="map-expand-btn" type="button" aria-expanded="false" aria-label="Expandir visualizacao do mapa">⛶ Expandir</button>
+          </div>
         </div>
         <div id="map"></div>
       </div>
@@ -458,17 +522,15 @@ FRONTEND_HTML = """
             </div>
             <div class="muted" id="list-meta">Carregando...</div>
           </div>
-          <span class="pill" id="visible-filter-pill">Filtro: Manual</span>
+          <span class="pill">Cadastro manual</span>
         </div>
         <table>
           <thead>
             <tr>
               <th>Area</th>
-              <th>Modo</th>
               <th>Agencia</th>
               <th>Relevancia</th>
               <th>Pontos</th>
-              <th>Atualizado</th>
               <th>Acoes</th>
             </tr>
           </thead>
@@ -483,107 +545,80 @@ FRONTEND_HTML = """
               <span class="nav-icon">✎</span>
               <h2 id="editor-title">Cadastro manual</h2>
             </div>
-            <div class="muted" id="editor-subtitle">Preencha os dados e ajuste a area antes de salvar.</div>
+            <div class="muted" id="editor-subtitle">Preencha em etapas e confirme a visualizacao antes de salvar.</div>
           </div>
-          <span class="pill" id="editor-pill">Modo ativo: Manual</span>
+          <span class="pill" id="editor-pill">Manual</span>
         </div>
 
         <div class="form-panel active" id="manual-panel">
           <form id="manual-form">
-            <div class="form-grid">
-              <div>
-                <label for="manual-name">Nome</label>
-                <input id="manual-name" required />
+            <div class="form-section">
+              <div class="form-section-head">
+                <span class="nav-icon">ID</span>
+                <div>
+                  <strong>Identificacao</strong>
+                  <div class="mini">Nome publico e identificador tecnico da area.</div>
+                </div>
               </div>
-              <div>
-                <label for="manual-slug">Slug</label>
-                <input id="manual-slug" required pattern="^[a-z0-9_]+$" />
-              </div>
-            </div>
-            <div class="form-grid triple">
-              <div>
-                <label for="manual-agencia">Agencia</label>
-                <input id="manual-agencia" required />
-              </div>
-              <div>
-                <label for="manual-relevancia">Relevancia (1-10)</label>
-                <input id="manual-relevancia" type="number" min="1" max="10" required />
-              </div>
-              <div class="color-field">
-                <label for="manual-color">Cor</label>
-                <input id="manual-color" class="color-picker" type="color" value="#0b7285" />
+              <div class="form-grid identity">
+                <div>
+                  <label for="manual-name">Nome</label>
+                  <input id="manual-name" required />
+                </div>
+                <div>
+                  <label for="manual-slug">Slug</label>
+                  <input id="manual-slug" required pattern="^[a-z0-9_]+$" />
+                </div>
               </div>
             </div>
-            <div class="form-grid full">
-              <div>
-                <label for="manual-polygons">Area do mapa</label>
-                <textarea id="manual-polygons" required>[{"type":"Polygon","coordinates":[[[-46.64,-23.55],[-46.62,-23.55],[-46.62,-23.56],[-46.64,-23.56],[-46.64,-23.55]]]}]</textarea>
+
+            <div class="form-section">
+              <div class="form-section-head">
+                <span class="nav-icon">★</span>
+                <div>
+                  <strong>Classificacao</strong>
+                  <div class="mini">Agencia responsavel, prioridade visual e cor no mapa.</div>
+                </div>
+              </div>
+              <div class="form-grid meta">
+                <div>
+                  <label for="manual-agencia">Agencia</label>
+                  <input id="manual-agencia" required />
+                </div>
+                <div>
+                  <label for="manual-relevancia">Relevancia</label>
+                  <div class="icon-input">
+                    <span>★</span>
+                    <input id="manual-relevancia" type="number" min="1" max="10" required />
+                  </div>
+                </div>
+                <div class="color-field">
+                  <label for="manual-color">Cor</label>
+                  <input id="manual-color" class="color-picker" type="color" value="#0b7285" />
+                </div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-head">
+                <span class="nav-icon">⌖</span>
+                <div>
+                  <strong>Geometria</strong>
+                  <div class="mini">Cole um array de polygons ou uma FeatureCollection GeoJSON.</div>
+                </div>
+              </div>
+              <div class="form-grid full">
+                <div>
+                  <label for="manual-polygons">Area do mapa</label>
+                  <textarea id="manual-polygons" required>[{"type":"Polygon","coordinates":[[[-46.64,-23.55],[-46.62,-23.55],[-46.62,-23.56],[-46.64,-23.56],[-46.64,-23.55]]]}]</textarea>
+                  <div class="field-hint">Use "Ver no mapa" para validar a geometria antes de salvar.</div>
+                </div>
               </div>
             </div>
             <div class="row-actions" style="margin-top:10px;">
               <button class="primary" type="submit">✦ Salvar manual</button>
               <button type="button" id="manual-preview-btn">⌖ Ver no mapa</button>
               <button type="button" id="manual-reset-btn">↺ Limpar</button>
-            </div>
-          </form>
-          <div class="note-box">
-            Use este modo para criar, revisar e ajustar areas com mais controle.
-          </div>
-        </div>
-
-        <div class="form-panel" id="automatic-panel">
-          <form id="automatic-form">
-            <div class="form-grid">
-              <div>
-                <label for="automatic-name">Nome</label>
-                <input id="automatic-name" required />
-              </div>
-              <div>
-                <label for="automatic-slug">Slug</label>
-                <input id="automatic-slug" required pattern="^[a-z0-9_]+$" />
-              </div>
-            </div>
-            <div class="form-grid triple">
-              <div>
-                <label for="automatic-agencia">Agencia</label>
-                <input id="automatic-agencia" required />
-              </div>
-              <div>
-                <label for="automatic-relevancia">Relevancia (1-10)</label>
-                <input id="automatic-relevancia" type="number" min="1" max="10" required />
-              </div>
-              <div class="color-field">
-                <label for="automatic-color">Cor</label>
-                <input id="automatic-color" class="color-picker" type="color" value="#0b7285" />
-              </div>
-            </div>
-            <div class="form-grid">
-              <div>
-                <label for="automatic-source-kind">Como deseja importar</label>
-                <select id="automatic-source-kind">
-                  <option value="kml_upload">Arquivo KML/KMZ</option>
-                  <option value="network_link">Arquivo com atualizacao automatica</option>
-                </select>
-              </div>
-              <div id="refresh-interval-wrapper">
-                <label for="automatic-refresh-interval">Intervalo de atualizacao (segundos)</label>
-                <input id="automatic-refresh-interval" type="number" min="30" step="30" value="300" />
-              </div>
-            </div>
-            <div class="form-grid full">
-              <div>
-                <label for="automatic-file">Arquivo</label>
-                <input id="automatic-file" type="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz" />
-              </div>
-            </div>
-            <div class="note-box" id="automatic-source-summary">
-              Envie um arquivo para visualizar a area e salvar com atualizacao sempre que precisar.
-            </div>
-            <div class="row-actions" style="margin-top:10px;">
-              <button class="primary" type="submit">✦ Salvar automatico</button>
-              <button type="button" id="automatic-preview-btn">⌖ Ver arquivo</button>
-              <button type="button" class="warning" id="automatic-refresh-btn">↻ Atualizar agora</button>
-              <button type="button" id="automatic-reset-btn">↺ Limpar</button>
             </div>
           </form>
         </div>
@@ -616,6 +651,7 @@ FRONTEND_HTML = """
       areas: [],
       previewLayer: null,
       mapRenderToken: 0,
+      mapExpanded: false,
     };
 
     const DEFAULT_MANUAL_POLYGONS = '[{"type":"Polygon","coordinates":[[[-46.64,-23.55],[-46.62,-23.55],[-46.62,-23.56],[-46.64,-23.56],[-46.64,-23.55]]]}]';
@@ -630,6 +666,7 @@ FRONTEND_HTML = """
     const areaLayersBySlug = new Map();
 
     const els = {
+      appShell: document.getElementById("app-shell"),
       body: document.getElementById("areas-body"),
       listMeta: document.getElementById("list-meta"),
       mapMeta: document.getElementById("map-meta"),
@@ -637,14 +674,12 @@ FRONTEND_HTML = """
       visibleFilterPill: document.getElementById("visible-filter-pill"),
       metricVisible: document.getElementById("metric-visible"),
       metricTotal: document.getElementById("metric-total"),
-      metricAutomatic: document.getElementById("metric-automatic"),
+      metricAgencies: document.getElementById("metric-agencies"),
+      mapExpandBtn: document.getElementById("map-expand-btn"),
       editorTitle: document.getElementById("editor-title"),
       editorSubtitle: document.getElementById("editor-subtitle"),
       editorPill: document.getElementById("editor-pill"),
       manualPanel: document.getElementById("manual-panel"),
-      automaticPanel: document.getElementById("automatic-panel"),
-      manualTab: document.getElementById("tab-manual"),
-      automaticTab: document.getElementById("tab-automatic"),
       status: document.getElementById("status"),
       areaJson: document.getElementById("area-json"),
       selectionPill: document.getElementById("selection-pill"),
@@ -657,20 +692,6 @@ FRONTEND_HTML = """
       manualPolygons: document.getElementById("manual-polygons"),
       manualPreviewBtn: document.getElementById("manual-preview-btn"),
       manualResetBtn: document.getElementById("manual-reset-btn"),
-      automaticForm: document.getElementById("automatic-form"),
-      automaticName: document.getElementById("automatic-name"),
-      automaticSlug: document.getElementById("automatic-slug"),
-      automaticAgencia: document.getElementById("automatic-agencia"),
-      automaticRelevancia: document.getElementById("automatic-relevancia"),
-      automaticColor: document.getElementById("automatic-color"),
-      automaticSourceKind: document.getElementById("automatic-source-kind"),
-      automaticRefreshInterval: document.getElementById("automatic-refresh-interval"),
-      refreshIntervalWrapper: document.getElementById("refresh-interval-wrapper"),
-      automaticFile: document.getElementById("automatic-file"),
-      automaticSourceSummary: document.getElementById("automatic-source-summary"),
-      automaticPreviewBtn: document.getElementById("automatic-preview-btn"),
-      automaticRefreshBtn: document.getElementById("automatic-refresh-btn"),
-      automaticResetBtn: document.getElementById("automatic-reset-btn"),
     };
 
     function escapeHtml(value) {
@@ -698,7 +719,7 @@ FRONTEND_HTML = """
     }
 
     function modeLabel(mode) {
-      return mode === "automatic" ? "Automatico" : "Manual";
+      return "Manual";
     }
 
     function humanDate(value) {
@@ -709,7 +730,7 @@ FRONTEND_HTML = """
     }
 
     function getVisibleAreas() {
-      return state.areas.filter((area) => (area.mode || "manual") === state.activeMode);
+      return state.areas.filter((area) => (area.mode || "manual") === "manual");
     }
 
     function groupAreasByAgency(areas) {
@@ -729,22 +750,19 @@ FRONTEND_HTML = """
     }
 
     function updateMetrics() {
-      const automaticCount = state.areas.filter((area) => (area.mode || "manual") === "automatic").length;
-      els.metricVisible.textContent = String(getVisibleAreas().length);
-      els.metricTotal.textContent = String(state.areas.length);
-      els.metricAutomatic.textContent = String(automaticCount);
-      els.visibleFilterPill.textContent = `Filtro: ${modeLabel(state.activeMode)}`;
-      els.editorPill.textContent = `Modo ativo: ${modeLabel(state.activeMode)}`;
-      els.mapMeta.textContent = `${getVisibleAreas().length} area(s) visiveis no mapa de ${modeLabel(state.activeMode).toLowerCase()}.`;
-      if (state.activeMode === "automatic") {
-        els.modeNote.textContent = "Importe arquivos e mantenha as areas sincronizadas com menos trabalho manual.";
-        els.editorTitle.textContent = "Cadastro automatico";
-        els.editorSubtitle.textContent = "Envie um arquivo, revise a visualizacao e salve a area.";
-      } else {
-        els.modeNote.textContent = "Crie, revise e ajuste areas manualmente com visualizacao imediata no mapa.";
-        els.editorTitle.textContent = "Cadastro manual";
-        els.editorSubtitle.textContent = "Preencha os dados e confirme a visualizacao antes de salvar.";
-      }
+      const visibleAreas = getVisibleAreas();
+      const agencyCount = new Set(
+        visibleAreas.map((area) => String(area.agencia || "").trim()).filter(Boolean)
+      ).size;
+      els.metricVisible.textContent = String(visibleAreas.length);
+      els.metricTotal.textContent = String(visibleAreas.length);
+      els.metricAgencies.textContent = String(agencyCount);
+      els.visibleFilterPill.textContent = "Modo manual";
+      els.editorPill.textContent = "Manual";
+      els.mapMeta.textContent = `${visibleAreas.length} area(s) manuais visiveis no mapa.`;
+      els.modeNote.textContent = "Crie, revise e ajuste areas manualmente com visualizacao imediata no mapa.";
+      els.editorTitle.textContent = "Cadastro manual";
+      els.editorSubtitle.textContent = "Preencha em etapas e confirme a visualizacao antes de salvar.";
     }
 
     function colorFromSlug(slug) {
@@ -959,8 +977,7 @@ FRONTEND_HTML = """
       );
 
       const layer = L.featureGroup(layers);
-      const badge = area.mode === "automatic" ? "Automatico" : "Manual";
-      layer.bindPopup(`<strong>${escapeHtml(area.name)}</strong><br/>${escapeHtml(area.slug)}<br/>${escapeHtml(badge)}`);
+      layer.bindPopup(`<strong>${escapeHtml(area.name)}</strong><br/>${escapeHtml(area.slug)}<br/>Manual`);
       layer.on("click", () => {
         state.selectedSlug = area.slug;
         highlightSelectedArea();
@@ -977,29 +994,9 @@ FRONTEND_HTML = """
     }
 
     function renderModeTabs() {
-      els.manualTab.classList.toggle("active", state.activeMode === "manual");
-      els.automaticTab.classList.toggle("active", state.activeMode === "automatic");
-      els.manualPanel.classList.toggle("active", state.activeMode === "manual");
-      els.automaticPanel.classList.toggle("active", state.activeMode === "automatic");
+      state.activeMode = "manual";
+      els.manualPanel.classList.add("active");
       updateMetrics();
-    }
-
-    function renderAutomaticSourceSummary(automaticSource, extraLabel = "") {
-      if (!automaticSource) {
-        els.automaticSourceSummary.textContent = "Envie um arquivo para visualizar a area e salvar com a configuracao desejada.";
-        return;
-      }
-
-      const lines = [];
-      if (extraLabel) lines.push(`<strong>${escapeHtml(extraLabel)}</strong>`);
-      lines.push(`Origem: ${escapeHtml(automaticSource.type === "network_link" ? "Atualizacao automatica" : "Arquivo enviado")}`);
-      if (automaticSource.source_file_name) lines.push(`Arquivo: ${escapeHtml(automaticSource.source_file_name)}`);
-      if (automaticSource.link_name) lines.push(`Referencia: ${escapeHtml(automaticSource.link_name)}`);
-      if (automaticSource.resolved_document_name) lines.push(`Mapa carregado: ${escapeHtml(automaticSource.resolved_document_name)}`);
-      if (automaticSource.refresh_interval_seconds) lines.push(`Atualizacao: a cada ${escapeHtml(automaticSource.refresh_interval_seconds)}s`);
-      if (automaticSource.last_refreshed_at) lines.push(`Ultima atualizacao: ${escapeHtml(humanDate(automaticSource.last_refreshed_at))}`);
-      if (automaticSource.last_refresh_error) lines.push(`Atencao: ${escapeHtml(automaticSource.last_refresh_error)}`);
-      els.automaticSourceSummary.innerHTML = lines.join("<br/>");
     }
 
     function resetManualForm() {
@@ -1017,27 +1014,9 @@ FRONTEND_HTML = """
       }
     }
 
-    function resetAutomaticForm() {
-      if (state.editingMode === "automatic") {
-        state.editingSlug = null;
-        state.editingMode = null;
-      }
-      els.automaticForm.reset();
-      els.automaticRelevancia.value = 1;
-      els.automaticColor.value = "#0b7285";
-      els.automaticSourceKind.value = "kml_upload";
-      els.automaticRefreshInterval.value = 300;
-      toggleAutomaticRefreshInterval();
-      renderAutomaticSourceSummary(null);
-      removePreviewLayer();
-      if (state.activeMode === "automatic") {
-        setStatus("");
-      }
-    }
-
     function resetSelectionIfHidden() {
       const selectedSummary = state.areas.find((area) => area.slug === state.selectedSlug);
-      if (!selectedSummary || (selectedSummary.mode || "manual") !== state.activeMode) {
+      if (!selectedSummary || (selectedSummary.mode || "manual") !== "manual") {
         state.selectedSlug = null;
         els.selectionPill.textContent = "Nenhuma area selecionada";
         els.areaJson.textContent = "Selecione uma area para visualizar os detalhes.";
@@ -1079,10 +1058,10 @@ FRONTEND_HTML = """
 
     function renderAreaList() {
       const visibleAreas = getVisibleAreas();
-      els.listMeta.textContent = `${visibleAreas.length} area(s) em ${modeLabel(state.activeMode).toLowerCase()} de um total de ${state.areas.length}.`;
+      els.listMeta.textContent = `${visibleAreas.length} area(s) manuais cadastradas.`;
 
       if (!visibleAreas.length) {
-        els.body.innerHTML = '<tr><td colspan="7" class="muted">Nenhuma area cadastrada neste modo.</td></tr>';
+        els.body.innerHTML = '<tr><td colspan="5" class="muted">Nenhuma area manual cadastrada.</td></tr>';
         return;
       }
 
@@ -1090,13 +1069,6 @@ FRONTEND_HTML = """
       els.body.innerHTML = groupedAreas.map((group) => {
         const groupRows = group.areas.map((area) => {
         const color = normalizeColor(area.color, area.slug);
-        const refreshText = area.mode === "automatic"
-          ? (area.last_refresh_error ? `Erro: ${escapeHtml(area.last_refresh_error)}` : escapeHtml(humanDate(area.last_refreshed_at)))
-          : "-";
-        const badgeClass = area.mode === "automatic" ? "automatic" : "manual";
-        const refreshButton = area.mode === "automatic" && area.automatic_source_type === "network_link"
-          ? `<button class="warning" onclick="refreshAutomaticArea('${area.slug}')">↻ Atualizar</button>`
-          : "";
 
         return `
           <tr>
@@ -1109,27 +1081,24 @@ FRONTEND_HTML = """
                 <span class="mini"><code>${escapeHtml(area.slug)}</code></span>
               </div>
             </td>
-            <td><span class="badge ${badgeClass}">${escapeHtml(modeLabel(area.mode || "manual"))}</span></td>
             <td>
               <div class="name-cell">
                 <span>${escapeHtml(area.agencia || "-")}</span>
                 <span class="mini">${escapeHtml(color)}</span>
               </div>
             </td>
-            <td>${escapeHtml(area.relevancia ?? "-")}</td>
+            <td><span class="badge manual">★ ${escapeHtml(area.relevancia ?? "-")}</span></td>
             <td>
               <div class="name-cell">
                 <span>${escapeHtml(area.total_points)}</span>
                 <span class="mini">${escapeHtml(area.polygon_count)} polygon(s)</span>
               </div>
             </td>
-            <td class="mini">${refreshText}</td>
             <td>
               <div class="row-actions">
                 <button onclick="viewArea('${area.slug}')">◉ Ver</button>
                 <button onclick="focusAreaOnMap('${area.slug}')">⌖ Mapa</button>
                 <button onclick="editArea('${area.slug}')">✎ Editar</button>
-                ${refreshButton}
                 <button class="danger" onclick="deleteArea('${area.slug}')">× Excluir</button>
               </div>
             </td>
@@ -1139,7 +1108,7 @@ FRONTEND_HTML = """
 
         return `
           <tr class="agency-group-row">
-            <td colspan="7">
+            <td colspan="5">
               <div class="agency-group">
                 <strong><span class="nav-icon">⌂</span>${escapeHtml(group.agency)}</strong>
                 <span class="agency-count">${group.areas.length} area(s)</span>
@@ -1179,16 +1148,13 @@ FRONTEND_HTML = """
     async function viewArea(slug, preserveStatus = false) {
       try {
         const data = await getAreaDetails(slug);
-        state.selectedSlug = slug;
-        const areaMode = data.mode || "manual";
-        if (areaMode !== state.activeMode) {
-          state.activeMode = areaMode;
-          renderModeTabs();
-          renderAreaList();
-          await renderMapForActiveMode();
+        if ((data.mode || "manual") !== "manual") {
+          setStatus("Esta interface exibe apenas areas manuais.", true);
+          return;
         }
+        state.selectedSlug = slug;
         els.areaJson.textContent = JSON.stringify(data, null, 2);
-        els.selectionPill.textContent = `${data.name} (${modeLabel(areaMode)})`;
+        els.selectionPill.textContent = `${data.name} (Manual)`;
         highlightSelectedArea();
 
         const layerEntry = areaLayersBySlug.get(slug);
@@ -1209,11 +1175,9 @@ FRONTEND_HTML = """
       const summary = state.areas.find((area) => area.slug === slug);
       if (!summary) return;
 
-      if ((summary.mode || "manual") !== state.activeMode) {
-        state.activeMode = summary.mode || "manual";
-        renderModeTabs();
-        renderAreaList();
-        await renderMapForActiveMode();
+      if ((summary.mode || "manual") !== "manual") {
+        setStatus("Esta interface exibe apenas areas manuais.", true);
+        return;
       }
 
       state.selectedSlug = slug;
@@ -1229,36 +1193,24 @@ FRONTEND_HTML = """
     async function editArea(slug) {
       try {
         const data = await getAreaDetails(slug);
+        if ((data.mode || "manual") !== "manual") {
+          setStatus("Esta interface permite editar apenas areas manuais.", true);
+          return;
+        }
         state.editingSlug = slug;
-        state.editingMode = data.mode || "manual";
+        state.editingMode = "manual";
         state.selectedSlug = slug;
         els.areaJson.textContent = JSON.stringify(data, null, 2);
-        els.selectionPill.textContent = `${data.name} (${modeLabel(data.mode || "manual")})`;
-
-        if ((data.mode || "manual") === "automatic") {
-          state.activeMode = "automatic";
-          renderModeTabs();
-          els.automaticName.value = data.name || "";
-          els.automaticSlug.value = data.slug || "";
-          els.automaticAgencia.value = data.agencia || "";
-          els.automaticRelevancia.value = data.relevancia || 1;
-          els.automaticColor.value = normalizeColor(data.color, data.slug || slug);
-          els.automaticSourceKind.value = data.automatic_source?.type || "kml_upload";
-          els.automaticRefreshInterval.value = data.automatic_source?.refresh_interval_seconds || 300;
-          toggleAutomaticRefreshInterval();
-          renderAutomaticSourceSummary(data.automatic_source, "Fonte atualmente salva");
-          setStatus("Modo edicao automatico ativado.");
-        } else {
-          state.activeMode = "manual";
-          renderModeTabs();
-          els.manualName.value = data.name || "";
-          els.manualSlug.value = data.slug || "";
-          els.manualAgencia.value = data.agencia || "";
-          els.manualRelevancia.value = data.relevancia || 1;
-          els.manualColor.value = normalizeColor(data.color, data.slug || slug);
-          els.manualPolygons.value = JSON.stringify(data.polygons || [], null, 2);
-          setStatus("Modo edicao manual ativado.");
-        }
+        els.selectionPill.textContent = `${data.name} (Manual)`;
+        state.activeMode = "manual";
+        renderModeTabs();
+        els.manualName.value = data.name || "";
+        els.manualSlug.value = data.slug || "";
+        els.manualAgencia.value = data.agencia || "";
+        els.manualRelevancia.value = data.relevancia || 1;
+        els.manualColor.value = normalizeColor(data.color, data.slug || slug);
+        els.manualPolygons.value = JSON.stringify(data.polygons || [], null, 2);
+        setStatus("Modo edicao manual ativado.");
 
         renderAreaList();
         await renderMapForActiveMode();
@@ -1282,7 +1234,6 @@ FRONTEND_HTML = """
       if (state.editingSlug === slug) {
         state.editingMode = null;
         resetManualForm();
-        resetAutomaticForm();
       }
       if (state.selectedSlug === slug) {
         state.selectedSlug = null;
@@ -1353,196 +1304,25 @@ FRONTEND_HTML = """
       await viewArea(payload.slug, true);
     }
 
-    function buildAutomaticFormData() {
-      const formData = new FormData();
-      formData.append("name", els.automaticName.value.trim());
-      formData.append("slug", els.automaticSlug.value.trim());
-      formData.append("agencia", els.automaticAgencia.value.trim());
-      formData.append("relevancia", String(Number(els.automaticRelevancia.value)));
-      formData.append("color", normalizeColor(els.automaticColor.value, els.automaticSlug.value.trim()));
-      formData.append("source_kind", els.automaticSourceKind.value);
-      if (els.automaticSourceKind.value === "network_link") {
-        formData.append("refresh_interval_seconds", String(Number(els.automaticRefreshInterval.value || 300)));
+    async function refitVisibleMap() {
+      if (state.selectedSlug && areaLayersBySlug.has(state.selectedSlug)) {
+        const entry = areaLayersBySlug.get(state.selectedSlug);
+        const bounds = entry.layer.getBounds();
+        if (bounds.isValid()) map.fitBounds(bounds.pad(0.2));
+        return;
       }
-      if (state.editingMode === "automatic" && state.editingSlug) {
-        formData.append("editing_slug", state.editingSlug);
-      }
-      return formData;
+      await fitMapToAllAreas();
     }
 
-    async function previewAutomaticArea() {
-      removePreviewLayer();
-      const file = els.automaticFile.files[0];
-      if (!file) {
-        setStatus("Selecione um arquivo KML/KMZ para leitura.", true);
-        return;
-      }
-
-      const formData = new FormData();
-      formData.append("source_kind", els.automaticSourceKind.value);
-      if (els.automaticSourceKind.value === "network_link") {
-        formData.append("refresh_interval_seconds", String(Number(els.automaticRefreshInterval.value || 300)));
-      }
-      formData.append("file", file);
-
-      const res = await fetch(`${apiBase}/automatic/preview`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setStatus(extractApiErrorMessage(data), true);
-        return;
-      }
-
-      try {
-        drawPreviewPolygons(
-          data.polygons || [],
-          "Arquivo automatico lido com sucesso.",
-          normalizeColor(els.automaticColor.value, els.automaticSlug.value.trim())
-        );
-      } catch (error) {
-        setStatus(error.message || "Nao foi possivel desenhar o preview automatico.", true);
-        return;
-      }
-
-      if (!els.automaticName.value.trim() && data.document_name) {
-        els.automaticName.value = data.document_name;
-      }
-      if (!els.automaticSlug.value.trim() && data.document_name) {
-        els.automaticSlug.value = slugify(data.document_name);
-      }
-      renderAutomaticSourceSummary(data.automatic_source, "Preview da fonte");
-    }
-
-    async function saveAutomaticArea(event) {
-      event.preventDefault();
-      removePreviewLayer();
-
-      const file = els.automaticFile.files[0];
-      const isEditing = state.editingMode === "automatic" && !!state.editingSlug;
-
-      if (!isEditing && !file) {
-        setStatus("Selecione um arquivo KML/KMZ para salvar a area automatica.", true);
-        return;
-      }
-
-      if (file) {
-        const formData = buildAutomaticFormData();
-        formData.append("file", file);
-
-        const res = await fetch(`${apiBase}/automatic`, {
-          method: "POST",
-          body: formData,
-        });
-
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          setStatus(extractApiErrorMessage(data), true);
-          return;
-        }
-
-        const targetSlug = els.automaticSlug.value.trim();
-        state.editingSlug = targetSlug;
-        state.editingMode = "automatic";
-        state.selectedSlug = targetSlug;
-        renderAutomaticSourceSummary(data.area?.automatic_source, "Fonte salva");
-        setStatus(isEditing ? "Area automatica atualizada com sucesso." : "Area automatica salva com sucesso.");
-        await loadAreas({ silent: true, preserveStatus: true });
-        await viewArea(targetSlug, true);
-        return;
-      }
-
-      const current = await getAreaDetails(state.editingSlug).catch(() => null);
-      if (!current) {
-        setStatus("Nao foi possivel carregar a area automatica para atualizar.", true);
-        return;
-      }
-
-      const currentSource = current.automatic_source || {};
-      const requestedSourceKind = els.automaticSourceKind.value;
-      if ((currentSource.type || "kml_upload") !== requestedSourceKind) {
-        setStatus("Para trocar o tipo de origem automatica, envie um novo arquivo.", true);
-        return;
-      }
-
-      const automaticSource = {
-        ...currentSource,
-        refresh_interval_seconds: requestedSourceKind === "network_link"
-          ? Number(els.automaticRefreshInterval.value || currentSource.refresh_interval_seconds || 300)
-          : null,
-      };
-
-      const payload = {
-        name: els.automaticName.value.trim(),
-        slug: els.automaticSlug.value.trim(),
-        agencia: els.automaticAgencia.value.trim(),
-        relevancia: Number(els.automaticRelevancia.value),
-        color: normalizeColor(els.automaticColor.value, els.automaticSlug.value.trim()),
-        mode: "automatic",
-        automatic_source: automaticSource,
-      };
-
-      const res = await fetch(`${apiBase}/${state.editingSlug}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setStatus(extractApiErrorMessage(data), true);
-        return;
-      }
-
-      state.editingSlug = payload.slug;
-      state.editingMode = "automatic";
-      state.selectedSlug = payload.slug;
-      renderAutomaticSourceSummary(data.area?.automatic_source || automaticSource, "Fonte salva");
-      setStatus("Metadados da area automatica atualizados com sucesso.");
-      await loadAreas({ silent: true, preserveStatus: true });
-      await viewArea(payload.slug, true);
-    }
-
-    async function refreshAutomaticArea(slug = null) {
-      const targetSlug = slug || (state.editingMode === "automatic" ? state.editingSlug : null) || state.selectedSlug;
-      if (!targetSlug) {
-        setStatus("Selecione uma area automatica para forcar refresh.", true);
-        return;
-      }
-
-      const res = await fetch(`${apiBase}/${targetSlug}/refresh`, { method: "POST" });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setStatus(extractApiErrorMessage(data), true);
-        return;
-      }
-
-      if (data.area?.automatic_source) {
-        renderAutomaticSourceSummary(data.area.automatic_source, "Refresh executado");
-      }
-      state.selectedSlug = targetSlug;
-      setStatus(`Refresh concluido para '${targetSlug}'.`);
-      await loadAreas({ silent: true, preserveStatus: true });
-      await viewArea(targetSlug, true);
-    }
-
-    function toggleAutomaticRefreshInterval() {
-      const isNetworkLink = els.automaticSourceKind.value === "network_link";
-      els.refreshIntervalWrapper.classList.toggle("hidden", !isNetworkLink);
-    }
-
-    function activateMode(mode) {
-      state.activeMode = mode;
-      renderModeTabs();
-      renderAreaList();
-      renderMapForActiveMode();
-      if (mode === "manual") {
-        setStatus("Modo manual ativo.");
-      } else {
-        setStatus("Modo automatico ativo.");
-      }
+    function toggleMapExpanded() {
+      state.mapExpanded = !state.mapExpanded;
+      els.appShell.classList.toggle("map-expanded", state.mapExpanded);
+      els.mapExpandBtn.setAttribute("aria-expanded", String(state.mapExpanded));
+      els.mapExpandBtn.textContent = state.mapExpanded ? "↙ Recolher" : "⛶ Expandir";
+      window.setTimeout(() => {
+        map.invalidateSize();
+        refitVisibleMap();
+      }, 340);
     }
 
     function wireAutoSlug(inputEl, slugEl) {
@@ -1560,19 +1340,11 @@ FRONTEND_HTML = """
     els.manualForm.addEventListener("submit", saveManualArea);
     els.manualPreviewBtn.addEventListener("click", previewManualPolygons);
     els.manualResetBtn.addEventListener("click", resetManualForm);
-    els.automaticForm.addEventListener("submit", saveAutomaticArea);
-    els.automaticPreviewBtn.addEventListener("click", previewAutomaticArea);
-    els.automaticRefreshBtn.addEventListener("click", () => refreshAutomaticArea());
-    els.automaticResetBtn.addEventListener("click", resetAutomaticForm);
-    els.automaticSourceKind.addEventListener("change", toggleAutomaticRefreshInterval);
-    els.manualTab.addEventListener("click", () => activateMode("manual"));
-    els.automaticTab.addEventListener("click", () => activateMode("automatic"));
+    els.mapExpandBtn.addEventListener("click", toggleMapExpanded);
 
     wireAutoSlug(els.manualName, els.manualSlug);
-    wireAutoSlug(els.automaticName, els.automaticSlug);
 
     resetManualForm();
-    resetAutomaticForm();
     renderModeTabs();
     loadAreas();
     setInterval(() => {
@@ -1583,7 +1355,6 @@ FRONTEND_HTML = """
     window.focusAreaOnMap = focusAreaOnMap;
     window.editArea = editArea;
     window.deleteArea = deleteArea;
-    window.refreshAutomaticArea = refreshAutomaticArea;
   </script>
 </body>
 </html>
