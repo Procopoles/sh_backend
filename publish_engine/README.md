@@ -30,18 +30,18 @@ Variaveis da Vercel:
 
 ```env
 PUBLISH_CONTROL_DATA_API_URL="https://pgapi.shprimenegocios.com.br"
-PUBLISH_CONTROL_SERVICE_KEY="<JWT_COM_ROLE_service_role>"
+PUBLISH_CONTROL_SERVICE_KEY="<PGRST_JWT_SECRET ou JWT_COM_ROLE_service_role>"
 ```
 
-`PUBLISH_CONTROL_SERVICE_KEY` nao e o `PGRST_JWT_SECRET`. Ela precisa ser um JWT assinado por esse segredo, com 3 partes separadas por ponto (`header.payload.signature`) e payload contendo `role: "service_role"`. Se a Vercel receber o segredo bruto nessa variavel, o PostgREST retorna erro semelhante a `Expected 3 parts in JWT; got 1`.
+`PUBLISH_CONTROL_SERVICE_KEY` pode ser o segredo simples usado em `PGRST_JWT_SECRET` ou um JWT ja pronto com role `service_role`. Quando a variavel recebe o segredo simples, o backend gera automaticamente um JWT assinado em runtime e usa esse token nos headers do PostgREST.
 
 A service key deve ser usada somente no servidor. Nunca exponha `PUBLISH_CONTROL_SERVICE_KEY` em componentes client-side ou no browser.
 
 Headers esperados nas chamadas server-side:
 
 ```http
-Authorization: Bearer <PUBLISH_CONTROL_SERVICE_KEY>
-apikey: <PUBLISH_CONTROL_SERVICE_KEY>
+Authorization: Bearer <JWT_service_role_gerado_ou_fornecido>
+apikey: <JWT_service_role_gerado_ou_fornecido>
 ```
 
 O header `apikey` e mantido por compatibilidade conceitual com Supabase. No PostgREST puro, o header realmente necessario para trocar a role e `Authorization`.
@@ -73,7 +73,7 @@ PGRST_JWT_SECRET: "owbaMiYwgwigoY6PegRZek8OWyST2JEPYPFwDNvXMjr"
 PGRST_SERVER_PROXY_URI: "https://pgapi.shprimenegocios.com.br"
 ```
 
-O `PGRST_JWT_SECRET` assina a service key JWT. A service key deve conter:
+O `PGRST_JWT_SECRET` assina a service key JWT. Se `PUBLISH_CONTROL_SERVICE_KEY` receber o segredo simples, a aplicacao gera automaticamente um JWT com:
 
 ```json
 {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "crypto";
+import { createHash, createHmac, randomUUID } from "crypto";
 
 type RequestOptions = {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
@@ -11,6 +11,7 @@ type ServiceKeyDiagnostics = {
   length: number;
   jwtParts: number;
   jwtShapeValid: boolean;
+  authMode: "missing" | "provided-jwt" | "generated-jwt";
   fingerprint: string | null;
 };
 
@@ -37,22 +38,13 @@ export function getDataApiDiagnostics(): DataApiDiagnostics {
 
 function getConfig() {
   const baseUrl = process.env.PUBLISH_CONTROL_DATA_API_URL?.trim();
-  const serviceKey = process.env.PUBLISH_CONTROL_SERVICE_KEY?.trim();
+  const configuredServiceKey = process.env.PUBLISH_CONTROL_SERVICE_KEY?.trim();
 
-  if (!baseUrl || !serviceKey) {
+  if (!baseUrl || !configuredServiceKey) {
     throw new Error("Gateway PostgREST nao configurado.");
   }
 
-  const keyDiagnostics = describeServiceKey(serviceKey);
-  if (!keyDiagnostics.jwtShapeValid) {
-    logDataApi("error", "data-api.config.invalid-service-key", {
-      dataApi: getDataApiDiagnostics(),
-      expected: "JWT com 3 partes no formato header.payload.signature"
-    });
-    throw new Error(
-      `PUBLISH_CONTROL_SERVICE_KEY invalida: esperado um JWT com 3 partes (header.payload.signature), mas o valor configurado tem ${keyDiagnostics.jwtParts} parte(s). Gere uma service key JWT assinada com PGRST_JWT_SECRET e role service_role.`
-    );
-  }
+  const serviceKey = resolveServiceJwt(configuredServiceKey);
 
   return {
     baseUrl: baseUrl.replace(/\/+$/, ""),
@@ -132,13 +124,33 @@ export async function dataApiRpc<T>(name: string, body: Record<string, unknown> 
 
 function describeServiceKey(serviceKey: string): ServiceKeyDiagnostics {
   const parts = serviceKey ? serviceKey.split(".") : [];
+  const jwtShapeValid = parts.length === 3 && parts.every(Boolean);
+
   return {
     configured: Boolean(serviceKey),
     length: serviceKey.length,
     jwtParts: parts.length,
-    jwtShapeValid: parts.length === 3 && parts.every(Boolean),
+    jwtShapeValid,
+    authMode: !serviceKey ? "missing" : jwtShapeValid ? "provided-jwt" : "generated-jwt",
     fingerprint: serviceKey ? createHash("sha256").update(serviceKey).digest("hex").slice(0, 12) : null
   };
+}
+
+function resolveServiceJwt(serviceKeyOrSecret: string) {
+  const diagnostics = describeServiceKey(serviceKeyOrSecret);
+  if (diagnostics.jwtShapeValid) return serviceKeyOrSecret;
+  return signServiceRoleJwt(serviceKeyOrSecret);
+}
+
+function signServiceRoleJwt(secret: string) {
+  const header = encodeJwtPart({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJwtPart({ role: "service_role" });
+  const signature = createHmac("sha256", secret).update(`${header}.${payload}`).digest("base64url");
+  return `${header}.${payload}.${signature}`;
+}
+
+function encodeJwtPart(value: Record<string, unknown>) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
 }
 
 function getUrlOrigin(url: string) {
