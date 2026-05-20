@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiErrorResponse } from "@/lib/api-monitoring";
 import { deletePortal, updatePortal } from "@/lib/repository";
 
 export const runtime = "nodejs";
@@ -17,10 +18,7 @@ export async function PUT(request: Request, context: Context) {
     if (!portal) return NextResponse.json({ error: "Portal não encontrado." }, { status: 404 });
     return NextResponse.json({ portal });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao atualizar portal." },
-      { status: 500 }
-    );
+    return apiErrorResponse("PUT /api/portals/[id]", error, "Erro ao atualizar portal.");
   }
 }
 
@@ -30,9 +28,6 @@ export async function DELETE(_: Request, context: Context) {
     await deletePortal(Number(id));
     return NextResponse.json({ ok: true });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao excluir portal." },
-      { status: 500 }
-    );
+    return apiErrorResponse("DELETE /api/portals/[id]", error, "Erro ao excluir portal.");
   }
 }

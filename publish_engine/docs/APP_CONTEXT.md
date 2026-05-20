@@ -1,4 +1,4 @@
-# Publish Control - Contexto Atual
+# Publish Engine - Contexto Atual
 
 Ultima atualizacao: 2026-05-08.
 

@@ -1,4 +1,4 @@
-# Publish Control
+# Publish Engine
 
 Aplicacao Next.js para gerenciar portais e regras de publicacao de imoveis.
 
@@ -32,6 +32,8 @@ Variaveis da Vercel:
 PUBLISH_CONTROL_DATA_API_URL="https://pgapi.shprimenegocios.com.br"
 PUBLISH_CONTROL_SERVICE_KEY="<JWT_COM_ROLE_service_role>"
 ```
+
+`PUBLISH_CONTROL_SERVICE_KEY` nao e o `PGRST_JWT_SECRET`. Ela precisa ser um JWT assinado por esse segredo, com 3 partes separadas por ponto (`header.payload.signature`) e payload contendo `role: "service_role"`. Se a Vercel receber o segredo bruto nessa variavel, o PostgREST retorna erro semelhante a `Expected 3 parts in JWT; got 1`.
 
 A service key deve ser usada somente no servidor. Nunca exponha `PUBLISH_CONTROL_SERVICE_KEY` em componentes client-side ou no browser.
 

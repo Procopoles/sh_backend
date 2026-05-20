@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiErrorResponse } from "@/lib/api-monitoring";
 import { createRule, listRules } from "@/lib/repository";
 
 export const runtime = "nodejs";
@@ -9,10 +10,7 @@ export async function GET(request: Request) {
     const portalId = searchParams.get("portalId");
     return NextResponse.json({ rules: await listRules(portalId ? Number(portalId) : undefined) });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao listar regras." },
-      { status: 500 }
-    );
+    return apiErrorResponse("GET /api/rules", error, "Erro ao listar regras.");
   }
 }
 
@@ -25,9 +23,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ rule: await createRule(body) }, { status: 201 });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao criar regra." },
-      { status: 500 }
-    );
+    return apiErrorResponse("POST /api/rules", error, "Erro ao criar regra.");
   }
 }

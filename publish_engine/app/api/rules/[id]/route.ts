@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiErrorResponse } from "@/lib/api-monitoring";
 import { deleteRule, updateRule } from "@/lib/repository";
 
 export const runtime = "nodejs";
@@ -17,10 +18,7 @@ export async function PUT(request: Request, context: Context) {
     if (!rule) return NextResponse.json({ error: "Regra nao encontrada." }, { status: 404 });
     return NextResponse.json({ rule });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao atualizar regra." },
-      { status: 500 }
-    );
+    return apiErrorResponse("PUT /api/rules/[id]", error, "Erro ao atualizar regra.");
   }
 }
 
@@ -30,9 +28,6 @@ export async function DELETE(_: Request, context: Context) {
     await deleteRule(Number(id));
     return NextResponse.json({ ok: true });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Erro ao excluir regra." },
-      { status: 500 }
-    );
+    return apiErrorResponse("DELETE /api/rules/[id]", error, "Erro ao excluir regra.");
   }
 }

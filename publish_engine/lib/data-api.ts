@@ -1,19 +1,57 @@
+import { createHash, randomUUID } from "crypto";
+
 type RequestOptions = {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   prefer?: string;
 };
 
+type ServiceKeyDiagnostics = {
+  configured: boolean;
+  length: number;
+  jwtParts: number;
+  jwtShapeValid: boolean;
+  fingerprint: string | null;
+};
+
+type DataApiDiagnostics = {
+  baseUrlConfigured: boolean;
+  baseUrlOrigin: string | null;
+  serviceKey: ServiceKeyDiagnostics;
+};
+
 export function isDataApiConfigured() {
   return Boolean(process.env.PUBLISH_CONTROL_DATA_API_URL && process.env.PUBLISH_CONTROL_SERVICE_KEY);
 }
 
+export function getDataApiDiagnostics(): DataApiDiagnostics {
+  const baseUrl = process.env.PUBLISH_CONTROL_DATA_API_URL?.trim() ?? "";
+  const serviceKey = process.env.PUBLISH_CONTROL_SERVICE_KEY?.trim() ?? "";
+
+  return {
+    baseUrlConfigured: Boolean(baseUrl),
+    baseUrlOrigin: getUrlOrigin(baseUrl),
+    serviceKey: describeServiceKey(serviceKey)
+  };
+}
+
 function getConfig() {
-  const baseUrl = process.env.PUBLISH_CONTROL_DATA_API_URL;
-  const serviceKey = process.env.PUBLISH_CONTROL_SERVICE_KEY;
+  const baseUrl = process.env.PUBLISH_CONTROL_DATA_API_URL?.trim();
+  const serviceKey = process.env.PUBLISH_CONTROL_SERVICE_KEY?.trim();
 
   if (!baseUrl || !serviceKey) {
     throw new Error("Gateway PostgREST nao configurado.");
+  }
+
+  const keyDiagnostics = describeServiceKey(serviceKey);
+  if (!keyDiagnostics.jwtShapeValid) {
+    logDataApi("error", "data-api.config.invalid-service-key", {
+      dataApi: getDataApiDiagnostics(),
+      expected: "JWT com 3 partes no formato header.payload.signature"
+    });
+    throw new Error(
+      `PUBLISH_CONTROL_SERVICE_KEY invalida: esperado um JWT com 3 partes (header.payload.signature), mas o valor configurado tem ${keyDiagnostics.jwtParts} parte(s). Gere uma service key JWT assinada com PGRST_JWT_SECRET e role service_role.`
+    );
   }
 
   return {
@@ -25,25 +63,61 @@ function getConfig() {
 export async function dataApiRequest<T>(path: string, options: RequestOptions = {}) {
   const { baseUrl, serviceKey } = getConfig();
   const method = options.method ?? "GET";
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
-    cache: "no-store",
-    headers: {
-      Authorization: `Bearer ${serviceKey}`,
-      apikey: serviceKey,
-      "Content-Type": "application/json",
-      ...(options.prefer ? { Prefer: options.prefer } : {})
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  let response: Response;
+
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      method,
+      cache: "no-store",
+      headers: {
+        Authorization: `Bearer ${serviceKey}`,
+        apikey: serviceKey,
+        "Content-Type": "application/json",
+        ...(options.prefer ? { Prefer: options.prefer } : {})
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    });
+  } catch (error) {
+    logDataApi("error", "data-api.request.failed", {
+      requestId,
+      method,
+      path,
+      elapsedMs: Date.now() - startedAt,
+      dataApi: getDataApiDiagnostics(),
+      error: serializeError(error)
+    });
+    throw new Error(`Falha ao conectar ao gateway PostgREST (${method} ${path}). Referencia: ${requestId}.`);
+  }
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  const data = parseResponseBody(text);
+  const elapsedMs = Date.now() - startedAt;
 
   if (!response.ok) {
-    const message = data?.message ?? data?.error ?? `Erro HTTP ${response.status} no gateway.`;
-    throw new Error(message);
+    const message = getGatewayErrorMessage(data, response.status);
+    logDataApi("error", "data-api.response.error", {
+      requestId,
+      method,
+      path,
+      status: response.status,
+      statusText: response.statusText,
+      elapsedMs,
+      postgrest: getPostgrestError(data),
+      responseBody: summarizeText(text),
+      dataApi: getDataApiDiagnostics()
+    });
+    throw new Error(`Erro no gateway PostgREST (${method} ${path}, HTTP ${response.status}). Referencia: ${requestId}. ${message}`);
   }
+
+  logDataApi("info", "data-api.response.ok", {
+    requestId,
+    method,
+    path,
+    status: response.status,
+    elapsedMs
+  });
 
   return data as T;
 }
@@ -54,4 +128,74 @@ export async function dataApiRpc<T>(name: string, body: Record<string, unknown> 
     body,
     prefer: "return=representation"
   });
+}
+
+function describeServiceKey(serviceKey: string): ServiceKeyDiagnostics {
+  const parts = serviceKey ? serviceKey.split(".") : [];
+  return {
+    configured: Boolean(serviceKey),
+    length: serviceKey.length,
+    jwtParts: parts.length,
+    jwtShapeValid: parts.length === 3 && parts.every(Boolean),
+    fingerprint: serviceKey ? createHash("sha256").update(serviceKey).digest("hex").slice(0, 12) : null
+  };
+}
+
+function getUrlOrigin(url: string) {
+  if (!url) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+function parseResponseBody(text: string) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+function getGatewayErrorMessage(data: unknown, status: number) {
+  if (isRecord(data)) {
+    return String(data.message ?? data.error ?? `Erro HTTP ${status} no gateway.`);
+  }
+  return `Erro HTTP ${status} no gateway.`;
+}
+
+function getPostgrestError(data: unknown) {
+  if (!isRecord(data)) return null;
+  return {
+    code: data.code ?? null,
+    message: data.message ?? null,
+    details: data.details ?? null,
+    hint: data.hint ?? null
+  };
+}
+
+function summarizeText(text: string) {
+  if (!text) return "";
+  return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack
+    };
+  }
+  return { message: String(error) };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function logDataApi(level: "info" | "error", event: string, details: Record<string, unknown>) {
+  console[level](`[publish-engine] ${event}`, details);
 }
