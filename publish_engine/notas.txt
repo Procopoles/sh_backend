@@ -1,0 +1,4 @@
+Próximos passos:
+- Filtros devem conseguir separar interpretar colunas jsonb, lendo campos json individualmente.
+- Melhorar design da edição de filtros, buscar referencia de layout para se basear
+- Trocar simbolos de comparação para por escrito, assim como metabase.

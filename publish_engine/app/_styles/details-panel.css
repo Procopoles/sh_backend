@@ -1,0 +1,355 @@
+/* Portal and rule detail panel */
+
+.portal-form,
+.rule-form {
+  display: grid;
+  gap: 16px;
+}
+
+.portal-form {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+  padding: 22px;
+}
+
+.rule-form {
+  padding: 20px 22px 24px;
+}
+
+.panel-mode-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: -4px;
+}
+
+.panel-heading {
+  border-bottom: 1px solid var(--line);
+  min-height: 58px;
+}
+
+.panel-heading.inset {
+  margin: -20px -22px 0;
+  padding: 20px 22px 18px;
+}
+
+.panel-heading-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.portal-editor-header {
+  align-items: start;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 116px minmax(0, 1fr);
+}
+
+.logo-uploader {
+  display: grid;
+  gap: 8px;
+}
+
+.logo-preview {
+  aspect-ratio: 1;
+  border-radius: 8px;
+  width: 100%;
+}
+
+.view-mode .logo-preview {
+  background: transparent;
+  border-color: transparent;
+}
+
+.logo-uploader input[type="file"] {
+  display: none;
+}
+
+.logo-upload-button {
+  min-height: 32px;
+  padding: 6px 8px;
+  width: 100%;
+}
+
+.portal-title-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.view-field {
+  color: var(--text);
+  display: block;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+  min-height: 36px;
+  padding: 8px 0;
+  width: 100%;
+}
+
+.view-field.multiline {
+  min-height: 44px;
+  white-space: pre-wrap;
+}
+
+.view-field.number {
+  text-align: right;
+}
+
+.portal-summary-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr auto;
+}
+
+.portal-summary-grid > div,
+.portal-summary-grid .summary-toggle,
+.summary-status {
+  background: var(--surface-muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 54px;
+  padding: 9px 10px;
+}
+
+.portal-summary-grid .summary-toggle {
+  min-width: 138px;
+}
+
+.portal-summary-grid > div span,
+.portal-summary-grid > div strong,
+.summary-status span,
+.summary-status strong {
+  display: block;
+}
+
+.portal-summary-grid > div span,
+.summary-status span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.portal-summary-grid > div strong,
+.summary-status strong {
+  color: var(--text);
+  font-size: 18px;
+}
+
+.view-mode .portal-summary-grid > div,
+.view-mode .summary-status {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.toggle-field {
+  align-items: center;
+  background: rgba(25, 28, 34, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 46px minmax(0, 1fr);
+  min-height: 54px;
+  padding: 8px 10px;
+}
+
+.toggle-field input {
+  height: 1px;
+  opacity: 0;
+  position: absolute;
+  width: 1px;
+}
+
+.toggle-switch {
+  background: var(--line-strong);
+  border-radius: 999px;
+  display: inline-flex;
+  height: 26px;
+  padding: 3px;
+  position: relative;
+  transition: background 0.18s ease;
+  width: 46px;
+}
+
+.toggle-switch::after {
+  background: #fff;
+  border-radius: 999px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  content: "";
+  height: 20px;
+  transition: transform 0.18s ease;
+  width: 20px;
+}
+
+.toggle-field input:checked + .toggle-switch {
+  background: var(--green);
+}
+
+.toggle-field input:checked + .toggle-switch::after {
+  transform: translateX(20px);
+}
+
+.toggle-field input:focus-visible + .toggle-switch {
+  outline: 3px solid rgba(34, 211, 238, 0.22);
+  outline-offset: 2px;
+}
+
+.toggle-field strong,
+.toggle-field small {
+  display: block;
+}
+
+.toggle-field strong {
+  font-size: 12px;
+}
+
+.toggle-field small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.quota-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.quota-heading {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  font-weight: 700;
+  justify-content: space-between;
+}
+
+.quota-heading strong {
+  color: var(--text);
+}
+
+.quota-list {
+  display: grid;
+  gap: 6px;
+}
+
+.quota-row {
+  align-items: center;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) 76px 32px;
+}
+
+.quota-row.view-row {
+  grid-template-columns: minmax(0, 1fr) 88px;
+}
+
+.quota-row input {
+  min-height: 34px;
+  padding: 7px 8px;
+}
+
+.quota-empty {
+  background: var(--surface-muted);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 10px;
+  text-align: center;
+}
+
+.form-actions {
+  flex-wrap: wrap;
+}
+
+.form-actions.end {
+  justify-content: flex-end;
+}
+
+.rule-details-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.rule-details-grid label {
+  min-width: 0;
+}
+
+.view-code-row {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.code-view-field {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: #94a3b8;
+  display: inline-block;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.45;
+  max-width: calc(100% - 30px);
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: auto;
+}
+
+.slug-copy-button {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #7f8ea3;
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+  width: 22px;
+}
+
+.slug-copy-button:hover:not(:disabled),
+.slug-copy-button:focus-visible {
+  background: rgba(255, 255, 255, 0.055);
+  border-color: transparent;
+  color: #cbd5e1;
+}
+
+.slug-copy-button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.toggle-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.ad-limit-panel {
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.portal-rules-section {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  margin-top: auto;
+  min-height: 120px;
+  padding: 20px 22px;
+}

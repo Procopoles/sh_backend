@@ -1,0 +1,55 @@
+/* Dark theme refinements */
+
+.search-box,
+.portal-directory,
+.rule-directory,
+.portal-form,
+.portal-rules-section,
+.filter-editor-card,
+.preview-rows-card,
+.filter-modal,
+.toggle-field {
+  background: rgba(25, 28, 34, 0.92);
+  border-color: var(--line);
+}
+
+.portal-directory-heading,
+.panel-heading,
+.filter-modal-heading,
+.filter-modal-actions {
+  border-color: var(--line);
+}
+
+.portal-row,
+.rule-row,
+.condition-row,
+.priority-row,
+.preview-rows-table td,
+.group-preview,
+.nested-filter-shell,
+.column-picker-option {
+  background: var(--surface);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.portal-row.header,
+.rule-row.header,
+.preview-rows-table th,
+.segmented,
+.portal-summary-grid > div,
+.portal-summary-grid .summary-toggle,
+.summary-status,
+.readonly-cell,
+.compact-empty,
+.column-picker-search,
+.column-picker-empty {
+  background: var(--surface-muted);
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.group-preview:hover .group-preview-icon {
+  background: rgba(52, 211, 153, 0.14);
+  border-color: rgba(52, 211, 153, 0.36);
+}
