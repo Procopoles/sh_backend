@@ -258,16 +258,27 @@
   align-items: center;
   display: grid;
   gap: 6px;
-  grid-template-columns: minmax(0, 1fr) 76px 32px;
+  grid-template-columns: minmax(0, 1fr) 76px 74px 32px;
 }
 
 .quota-row.view-row {
-  grid-template-columns: minmax(0, 1fr) 88px;
+  grid-template-columns: minmax(0, 1fr) 88px 64px;
 }
 
 .quota-row input {
   min-height: 34px;
   padding: 7px 8px;
+}
+
+.quota-tier-field {
+  align-items: center;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) 16px;
+}
+
+.quota-tier-help {
+  justify-content: center;
 }
 
 .quota-empty {

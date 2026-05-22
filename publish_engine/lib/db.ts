@@ -81,6 +81,8 @@ async function initializeControlSchema() {
 }
 
 async function runControlSchemaMigration(client: PoolClient) {
+  await client.query("create extension if not exists unaccent");
+
   await client.query(`
     create table if not exists publish_portals (
       id serial primary key,
@@ -127,7 +129,9 @@ async function runControlSchemaMigration(client: PoolClient) {
       id serial primary key,
       portal_id integer not null references publish_portals(id) on delete cascade,
       name text not null,
+      slug text not null,
       quantity integer not null default 0 check (quantity >= 0),
+      tier integer not null default 1 check (tier between 1 and 10),
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now(),
       unique (portal_id, name)
@@ -140,15 +144,109 @@ async function runControlSchemaMigration(client: PoolClient) {
   `);
 
   await client.query(`
-    create or replace function normalize_publish_portal_ad_type_name()
-    returns trigger
-    language plpgsql
+    create or replace function public.publish_slugify(value text)
+    returns text
+    language sql
+    immutable
     as $$
+      select coalesce(
+        nullif(
+          trim(both '_' from regexp_replace(lower(unaccent(value)), '[^a-z0-9]+', '_', 'g')),
+          ''
+        ),
+        'regra'
+      )
+    $$;
+  `);
+
+  await client.query(`
+    alter table if exists publish_portal_ad_types
+    add column if not exists slug text;
+
+    alter table if exists publish_portal_ad_types
+    add column if not exists tier integer;
+
+    update publish_portal_ad_types
+    set slug = public.publish_slugify(name)
+    where slug is null
+      or slug = ''
+      or slug <> public.publish_slugify(name);
+
+    with merged as (
+      select portal_id, slug, min(id) as keep_id, sum(quantity)::int as total_quantity
+      from publish_portal_ad_types
+      group by portal_id, slug
+      having count(*) > 1
+    )
+    update publish_portal_ad_types a
+    set quantity = merged.total_quantity,
+        updated_at = now()
+    from merged
+    where a.id = merged.keep_id;
+
+    with merged as (
+      select portal_id, slug, min(id) as keep_id
+      from publish_portal_ad_types
+      group by portal_id, slug
+      having count(*) > 1
+    )
+    delete from publish_portal_ad_types a
+    using merged
+    where a.portal_id = merged.portal_id
+      and a.slug = merged.slug
+      and a.id <> merged.keep_id;
+
+    with ranked as (
+      select id,
+             row_number() over (partition by portal_id order by quantity desc, id asc)::int as next_tier
+      from publish_portal_ad_types
+    )
+    update publish_portal_ad_types a
+    set tier = ranked.next_tier,
+        updated_at = now()
+    from ranked
+    where a.id = ranked.id
+      and (a.tier is null or a.tier < 1 or a.tier > 10);
+
+    do $$
     begin
-      new.name := lower(regexp_replace(btrim(new.name), '[[:space:]]+', ' ', 'g'));
-      return new;
+      if exists (
+        select 1
+        from publish_portal_ad_types
+        where tier is null
+           or tier < 1
+           or tier > 10
+      ) then
+        raise exception 'publish_portal_ad_types tier must be between 1 and 10.';
+      end if;
+
+      if exists (
+        select 1
+        from (
+          select portal_id, tier, count(*) as total
+          from publish_portal_ad_types
+          group by portal_id, tier
+          having count(*) > 1
+        ) duplicated_tiers
+      ) then
+        raise exception 'publish_portal_ad_types cannot repeat tier for the same portal.';
+      end if;
     end
     $$;
+
+    alter table publish_portal_ad_types
+    alter column slug set not null;
+
+    alter table publish_portal_ad_types
+    alter column tier set not null;
+
+    update publish_rules
+    set ad_limit_type = public.publish_slugify(ad_limit_type),
+        updated_at = now()
+    where ad_limit_type is not null
+      and btrim(ad_limit_type) <> ''
+      and ad_limit_type <> 'total'
+      and ad_limit_type <> public.publish_slugify(ad_limit_type);
   `);
 
   await client.query(`
@@ -156,18 +254,66 @@ async function runControlSchemaMigration(client: PoolClient) {
     begin
       if not exists (
         select 1
-        from pg_trigger
-        where tgname = 'publish_portal_ad_types_normalize_name'
-          and tgrelid = 'publish_portal_ad_types'::regclass
+        from pg_constraint
+        where conrelid = 'publish_portal_ad_types'::regclass
+          and conname = 'publish_portal_ad_types_slug_format_check'
       ) then
-        create trigger publish_portal_ad_types_normalize_name
-        before insert or update of name
-        on publish_portal_ad_types
-        for each row
-        execute function normalize_publish_portal_ad_type_name();
+        alter table publish_portal_ad_types
+        add constraint publish_portal_ad_types_slug_format_check
+        check (slug ~ '^[a-z0-9_]+$');
       end if;
     end
     $$;
+  `);
+
+  await client.query(`
+    create unique index if not exists publish_portal_ad_types_portal_id_slug_idx
+    on publish_portal_ad_types(portal_id, slug);
+  `);
+
+  await client.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conrelid = 'publish_portal_ad_types'::regclass
+          and conname = 'publish_portal_ad_types_tier_range_check'
+      ) then
+        alter table publish_portal_ad_types
+        add constraint publish_portal_ad_types_tier_range_check
+        check (tier between 1 and 10);
+      end if;
+    end
+    $$;
+  `);
+
+  await client.query(`
+    create unique index if not exists publish_portal_ad_types_portal_id_tier_idx
+    on publish_portal_ad_types(portal_id, tier);
+  `);
+
+  await client.query(`
+    create or replace function normalize_publish_portal_ad_type_name()
+    returns trigger
+    language plpgsql
+    as $$
+    begin
+      new.name := lower(regexp_replace(btrim(new.name), '[[:space:]]+', ' ', 'g'));
+      new.slug := public.publish_slugify(new.name);
+      return new;
+    end
+    $$;
+  `);
+
+  await client.query(`
+    drop trigger if exists publish_portal_ad_types_normalize_name on publish_portal_ad_types;
+
+    create trigger publish_portal_ad_types_normalize_name
+    before insert or update of name, slug
+    on publish_portal_ad_types
+    for each row
+    execute function normalize_publish_portal_ad_type_name();
   `);
 
   await client.query(`
@@ -237,7 +383,11 @@ async function runControlSchemaMigration(client: PoolClient) {
     stable
     as $$
     declare
-      normalized_type text := lower(regexp_replace(btrim(coalesce(target_ad_limit_type, 'total')), '[[:space:]]+', ' ', 'g'));
+      raw_type text := btrim(coalesce(target_ad_limit_type, 'total'));
+      normalized_type text := case
+        when raw_type = '' or lower(raw_type) = 'total' then 'total'
+        else public.publish_slugify(raw_type)
+      end;
       quota integer;
     begin
       if target_portal_id is null then
@@ -254,7 +404,7 @@ async function runControlSchemaMigration(client: PoolClient) {
         into quota
         from publish_portal_ad_types
         where portal_id = target_portal_id
-          and name = normalized_type;
+          and slug = normalized_type;
       end if;
 
       return coalesce(quota, 0);

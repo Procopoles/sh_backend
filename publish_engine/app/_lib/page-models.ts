@@ -8,7 +8,7 @@ export type MetadataResponse = {
 
 export type PortalForm = Pick<Portal, "name" | "slug" | "description" | "logo_url" | "active"> & {
   id?: number;
-  ad_types: Array<Pick<PortalAdType, "name" | "quantity">>;
+  ad_types: Array<Pick<PortalAdType, "name" | "quantity" | "tier">>;
 };
 
 export type RuleForm = {

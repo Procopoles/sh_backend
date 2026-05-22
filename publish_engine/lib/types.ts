@@ -2,7 +2,9 @@ export type PortalAdType = {
   id?: number;
   portal_id?: number;
   name: string;
+  slug: string;
   quantity: number;
+  tier: number;
   created_at?: string;
   updated_at?: string;
 };

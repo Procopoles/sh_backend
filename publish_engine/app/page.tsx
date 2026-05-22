@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import { ArrowDownAZ, ArrowUpAZ, Filter, Globe2, Image, ListOrdered, Loader2, Search } from "lucide-react";
-import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./page.css";
 import { FilterGroupBuilder } from "./_components/filter-group-builder";
 import { MaterialIcon } from "./_components/material-icon";
@@ -58,6 +58,7 @@ const HEALTHCHECK_INTERVAL_MINUTES = Math.max(
 const HEALTHCHECK_INTERVAL_MS = HEALTHCHECK_INTERVAL_MINUTES * 60 * 1000;
 const PORTAL_SLUG_HELP =
   "Identificador interno do portal usado pelo sistema. Deve corresponder exatamente a chave em publicacao_portais na base_imoveis, como grupo_zap, imovel_web ou chaves_na_mao. Use minusculas, numeros e _ sem espacos.";
+const AD_TIER_HELP = "Nível do anúncio.";
 
 function displayValue(value: string | number | null | undefined) {
   if (typeof value === "number") return formatNumber(value);
@@ -73,8 +74,9 @@ function formatTimestamp(value: string | null | undefined) {
   }).format(new Date(value));
 }
 
-function adLimitTypeLabel(value: string | null | undefined) {
-  return value === "total" || !value ? "Total" : value;
+function adLimitTypeLabel(value: string | null | undefined, portal?: Portal | null) {
+  if (value === "total" || !value) return "Total";
+  return portal?.ad_types?.find((adType) => adType.slug === value)?.name ?? value;
 }
 
 function ruleTotalQuota(portal?: Portal | null) {
@@ -84,7 +86,30 @@ function ruleTotalQuota(portal?: Portal | null) {
 function ruleAdLimitQuota(portal: Portal | null | undefined, adLimitType: string | null | undefined) {
   if (!portal) return 0;
   if (!adLimitType || adLimitType === "total") return ruleTotalQuota(portal);
-  return portal.ad_types?.find((adType) => adType.name === adLimitType)?.quantity ?? 0;
+  return portal.ad_types?.find((adType) => adType.slug === adLimitType)?.quantity ?? 0;
+}
+
+function compareAdTypesByQuantity<T extends Pick<PortalAdType, "quantity" | "tier" | "name">>(left: T, right: T) {
+  const quantityDelta = (Number(right.quantity) || 0) - (Number(left.quantity) || 0);
+  if (quantityDelta !== 0) return quantityDelta;
+  const tierDelta = (Number(left.tier) || 0) - (Number(right.tier) || 0);
+  if (tierDelta !== 0) return tierDelta;
+  return left.name.localeCompare(right.name, "pt-BR");
+}
+
+function normalizeAdTier(value: number | string | null | undefined) {
+  const tier = Math.trunc(Number(value) || 0);
+  if (tier < 1) return 1;
+  if (tier > 10) return 10;
+  return tier;
+}
+
+function nextAvailableAdTier(adTypes: PortalForm["ad_types"]) {
+  const usedTiers = new Set(adTypes.map((adType) => normalizeAdTier(adType.tier)));
+  for (let tier = 1; tier <= 10; tier += 1) {
+    if (!usedTiers.has(tier)) return tier;
+  }
+  return 10;
 }
 
 function formatRuleDelta(value: number) {
@@ -120,6 +145,10 @@ function statusAdTypeSlug(value: string) {
     .replace(/^_+|_+$/g, "");
 }
 
+function statusFinalViewName(portalSlug: string) {
+  return `pc_${portalSlug}_final`;
+}
+
 function statusLabel(rule: PublicationRule) {
   if (rule.health_error) return "Erro";
   if (rule.health_pending_count == null || rule.health_unexpected_count == null) return "Pendente";
@@ -127,25 +156,27 @@ function statusLabel(rule: PublicationRule) {
 }
 
 function buildStatusPublishedQuery(rule: PublicationRule) {
-  if (!rule.view_name || !rule.portal_slug) return "View ou portal indisponivel para montar a query.";
+  if (!rule.portal_slug) return "Portal indisponivel para montar a query.";
 
   const portalLiteral = quoteSqlLiteral(rule.portal_slug);
+  const finalViewName = statusFinalViewName(rule.portal_slug);
   const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
   const typeFilter = shouldFilterType && rule.ad_limit_type
-    ? `\n  AND b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
+    ? `\n  AND b.ad_type_slug = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}\n  AND b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
     : "";
 
   return [
     "SELECT count(*)::int AS count",
-    `FROM public.${quoteSqlIdentifier(rule.view_name)} b`,
+    `FROM public.${quoteSqlIdentifier(finalViewName)} b`,
     `WHERE COALESCE((b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter};`
   ].join("\n");
 }
 
 function buildStatusUnexpectedQuery(rule: PublicationRule) {
-  if (!rule.view_name || !rule.portal_slug) return "View ou portal indisponivel para montar a query.";
+  if (!rule.portal_slug) return "Portal indisponivel para montar a query.";
 
   const portalLiteral = quoteSqlLiteral(rule.portal_slug);
+  const finalViewName = statusFinalViewName(rule.portal_slug);
   const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
   const typeFilter = shouldFilterType && rule.ad_limit_type
     ? `\n  AND ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
@@ -157,11 +188,12 @@ function buildStatusUnexpectedQuery(rule: PublicationRule) {
     `WHERE COALESCE((ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter}`,
     "  AND NOT EXISTS (",
     "    SELECT 1",
-    `    FROM public.${quoteSqlIdentifier(rule.view_name)} p`,
+    `    FROM public.${quoteSqlIdentifier(finalViewName)} p`,
     "    WHERE p.codigo_crm = ia.codigo_crm",
+    shouldFilterType && rule.ad_limit_type ? `      AND p.ad_type_slug = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}` : "",
     "  )",
     "LIMIT 100;"
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function RuleCountCell({ rule }: { rule: PublicationRule }) {
@@ -286,6 +318,7 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const healthcheckInFlightRef = useRef(false);
   const [groupEditor, setGroupEditor] = useState<{
     mode: "create" | "edit";
     path: number[];
@@ -309,6 +342,9 @@ export default function Home() {
   const searchPlaceholder =
     activeView === "portals" ? "Buscar portal" : activeView === "rules" ? "Buscar regra" : "Buscar regra ativa";
   const portalFormTotal = portalForm.ad_types.reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
+  const orderedPortalFormAdTypes = portalForm.ad_types
+    .map((adType, index) => ({ adType, index }))
+    .sort((left, right) => compareAdTypesByQuantity(left.adType, right.adType));
   const isPortalEditing = portalMode === "edit" || !portalForm.id;
   const isRuleEditing = ruleMode === "edit" || !ruleForm?.id;
   const visiblePortals = portals.filter((portal) =>
@@ -392,7 +428,7 @@ export default function Home() {
     return [
       { value: "total", label: `Total (${formatNumber(ruleTotalQuota(selectedRulePortal))})` },
       ...(selectedRulePortal.ad_types ?? []).map((adType) => ({
-        value: adType.name,
+        value: adType.slug,
         label: `${adType.name} (${formatNumber(adType.quantity || 0)})`
       }))
     ];
@@ -566,8 +602,9 @@ export default function Home() {
       active: portal.active,
       ad_types: (portal.ad_types ?? []).map((adType) => ({
         name: adType.name,
-        quantity: adType.quantity
-      }))
+        quantity: adType.quantity,
+        tier: normalizeAdTier(adType.tier)
+      })).sort(compareAdTypesByQuantity)
     });
   }
 
@@ -638,17 +675,33 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
-  function updatePortalAdType(index: number, patch: Partial<Pick<PortalAdType, "name" | "quantity">>) {
+  function updatePortalAdType(index: number, patch: Partial<Pick<PortalAdType, "name" | "quantity" | "tier">>) {
     const adTypes = [...portalForm.ad_types];
     adTypes[index] = { ...adTypes[index], ...patch };
     setPortalForm({ ...portalForm, ad_types: adTypes });
   }
 
   function addPortalAdType() {
+    if (portalForm.ad_types.filter((adType) => adType.name.trim()).length >= 10) {
+      setError("Um portal pode ter no maximo 10 tipos de anuncio.");
+      return;
+    }
     setPortalForm({
       ...portalForm,
-      ad_types: [...portalForm.ad_types, { name: "", quantity: 0 }]
+      ad_types: [...portalForm.ad_types, { name: "", quantity: 0, tier: nextAvailableAdTier(portalForm.ad_types) }]
     });
+  }
+
+  function validatePortalAdTypes() {
+    const tiers = new Set<number>();
+    const adTypes = portalForm.ad_types.filter((adType) => adType.name.trim());
+    if (adTypes.length > 10) return "Um portal pode ter no maximo 10 tipos de anuncio.";
+    for (const adType of adTypes) {
+      const tier = normalizeAdTier(adType.tier);
+      if (tiers.has(tier)) return "Nao e permitido repetir o mesmo tier de anuncio para o mesmo portal.";
+      tiers.add(tier);
+    }
+    return null;
   }
 
   async function savePortal(event: FormEvent) {
@@ -656,6 +709,9 @@ export default function Home() {
     setSaving(true);
     setError(null);
     try {
+      const adTypesError = validatePortalAdTypes();
+      if (adTypesError) throw new Error(adTypesError);
+
       let savedPortal: Portal | null = null;
       if (portalForm.id) {
         const result = await fetchJson<{ portal: Portal }>(`/api/portals/${portalForm.id}`, {
@@ -822,6 +878,8 @@ export default function Home() {
   }
 
   async function loadRuleHealthchecks(ruleId?: number) {
+    if (healthcheckInFlightRef.current) return;
+    healthcheckInFlightRef.current = true;
     setHealthcheckLoading(true);
     setError(null);
     try {
@@ -849,6 +907,7 @@ export default function Home() {
     } catch (currentError) {
       setError(currentError instanceof Error ? currentError.message : "Erro ao executar healthcheck.");
     } finally {
+      healthcheckInFlightRef.current = false;
       setHealthcheckLoading(false);
     }
   }
@@ -1431,7 +1490,7 @@ export default function Home() {
               <strong>{formatNumber(portalFormTotal)}</strong>
             </div>
             <div className="quota-list">
-              {portalForm.ad_types.map((adType, index) => (
+              {orderedPortalFormAdTypes.map(({ adType, index }) => (
                 <div className={`quota-row ${isPortalEditing ? "" : "view-row"}`} key={index}>
                   {isPortalEditing ? (
                   <>
@@ -1447,6 +1506,20 @@ export default function Home() {
                     placeholder="Qtd."
                     onValueChange={(value) => updatePortalAdType(index, { quantity: localizedNumberToNumber(value) })}
                   />
+                  <span className="quota-tier-field">
+                    <NumericInput
+                      allowDecimal={false}
+                      allowNegative={false}
+                      min={1}
+                      max={10}
+                      value={adType.tier}
+                      placeholder="Tier"
+                      onValueChange={(value) => updatePortalAdType(index, { tier: normalizeAdTier(localizedNumberToNumber(value)) })}
+                    />
+                    <span className="field-help-icon quota-tier-help" title={AD_TIER_HELP} aria-label={AD_TIER_HELP}>
+                      <MaterialIcon name="info" size={14} />
+                    </span>
+                  </span>
                   <button
                     className="icon-button"
                     type="button"
@@ -1465,6 +1538,7 @@ export default function Home() {
                     <>
                       <span className="view-field">{displayValue(adType.name)}</span>
                       <span className="view-field number">{formatNumber(adType.quantity || 0)}</span>
+                      <span className="view-field number">{formatNumber(adType.tier)}</span>
                     </>
                   )}
                 </div>
@@ -1560,7 +1634,7 @@ export default function Home() {
                 <div className="status-query-card">
                   <div className="status-query-heading">
                     <span>Query de publicados</span>
-                    <strong>{selectedStatusRule.view_name ?? "View indisponivel"}</strong>
+                    <strong>{selectedStatusRule.portal_slug ? statusFinalViewName(selectedStatusRule.portal_slug) : "View final indisponivel"}</strong>
                   </div>
                   <pre>{buildStatusPublishedQuery(selectedStatusRule)}</pre>
                 </div>
@@ -1791,7 +1865,7 @@ export default function Home() {
                   <span className="toggle-switch" aria-hidden="true" />
                   <span>
                     <strong>Usar limite de anuncios</strong>
-                    <small>{ruleForm.use_ad_limit ? `${adLimitTypeLabel(currentAdLimitType)}: ${formatNumber(currentAdLimitQuota ?? 0)}` : "Sem limite"}</small>
+                    <small>{ruleForm.use_ad_limit ? `${adLimitTypeLabel(currentAdLimitType, selectedRulePortal)}: ${formatNumber(currentAdLimitQuota ?? 0)}` : "Sem limite"}</small>
                   </span>
                 </label>
                 </>
@@ -1809,7 +1883,7 @@ export default function Home() {
                   <span>Limite de anuncios</span>
                   <strong>
                     {ruleForm.use_ad_limit
-                      ? `${adLimitTypeLabel(currentAdLimitType)} (${formatNumber(currentAdLimitQuota ?? 0)})`
+                      ? `${adLimitTypeLabel(currentAdLimitType, selectedRulePortal)} (${formatNumber(currentAdLimitQuota ?? 0)})`
                       : "Sem limite"}
                   </strong>
                 </div>
@@ -1839,7 +1913,7 @@ export default function Home() {
                     </select>
                     ) : (
                       <span className="view-field">
-                        {selectedRulePortal ? `${adLimitTypeLabel(currentAdLimitType)} (${formatNumber(currentAdLimitQuota ?? 0)})` : "Sem portal"}
+                        {selectedRulePortal ? `${adLimitTypeLabel(currentAdLimitType, selectedRulePortal)} (${formatNumber(currentAdLimitQuota ?? 0)})` : "Sem portal"}
                       </span>
                     )}
                   </label>

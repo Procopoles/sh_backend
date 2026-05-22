@@ -9,6 +9,7 @@ import {
   buildRuleRowsPreviewQuery,
   DEFAULT_FILTERS,
   DEFAULT_PUBLICATION_PRIORITY,
+  RULE_INDEX_COLUMN,
   getBaseColumns,
   quoteIdentifier,
   quoteLiteral,
@@ -47,6 +48,7 @@ type PortalAdTypeInput = {
   id?: number;
   name: string;
   quantity: number;
+  tier?: number | string | null;
 };
 
 type RuleInput = {
@@ -81,9 +83,32 @@ const HEALTHCHECK_REPORT_CACHE_MS = Math.max(
   10_000,
   Number(process.env.HEALTHCHECK_REPORT_CACHE_MS ?? "120000") || 120_000
 );
+const HEALTHCHECK_REPORT_RULE_CONCURRENCY = Math.max(
+  1,
+  Math.min(2, Number(process.env.HEALTHCHECK_REPORT_RULE_CONCURRENCY ?? "1") || 1)
+);
+const FINAL_VIEW_AD_TYPE_NAME_COLUMN = "ad_type_name";
+const FINAL_VIEW_AD_TYPE_SLUG_COLUMN = "ad_type_slug";
+const FINAL_VIEW_TIER_COLUMN = "tier";
+const FINAL_VIEW_PUBLICATION_RANK_COLUMN = "publication_rank";
+const FINAL_VIEW_REQUIRED_COLUMNS = ["codigo_crm", "publicacao_portais"];
+const FINAL_VIEW_RESERVED_COLUMNS = new Set([
+  RULE_INDEX_COLUMN,
+  "__allocation_rule_order",
+  "__ad_type_duplicate_rank",
+  "__allocation_match_rank",
+  "__allocation_tier_distance",
+  "__candidate_ad_type_slug",
+  "__candidate_tier",
+  FINAL_VIEW_AD_TYPE_NAME_COLUMN,
+  FINAL_VIEW_AD_TYPE_SLUG_COLUMN,
+  FINAL_VIEW_TIER_COLUMN,
+  FINAL_VIEW_PUBLICATION_RANK_COLUMN
+]);
 
 let dataApiColumnsCache: { expiresAt: number; columns: ColumnMetadata[] } | null = null;
 let dataApiHealthcheckReportCache: { key: string; expiresAt: number; value: RuleHealthcheckReport } | null = null;
+let healthcheckRunQueue: Promise<unknown> = Promise.resolve();
 
 const healthcheckReportRuleCache = new Map<
   string,
@@ -107,10 +132,13 @@ export async function listPortals() {
             'id', a.id,
             'portal_id', a.portal_id,
             'name', a.name,
+            'slug', a.slug,
             'quantity', a.quantity,
+            'tier', a.tier,
             'created_at', a.created_at,
             'updated_at', a.updated_at
           )
+          order by a.quantity desc, a.tier asc, a.id asc
         ) filter (where a.id is not null),
         '[]'::jsonb
       ) as ad_types
@@ -137,6 +165,7 @@ export async function createPortal(input: PortalInput) {
       [input.name.trim(), slug, input.description ?? null, input.logo_url ?? null, input.active ?? true]
     );
     await replacePortalAdTypes(client, result.rows[0].id, input.ad_types ?? []);
+    await refreshPortalFinalView(client, result.rows[0].id);
     return getPortalById(client, result.rows[0].id);
   });
   invalidateHealthcheckReportCache();
@@ -148,6 +177,7 @@ export async function updatePortal(id: number, input: PortalInput) {
 
   await ensureControlSchema();
   const portal = await withTransaction(async (client) => {
+    const existingPortal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [id]);
     const slug = normalizePortalSlug(input.slug, input.name);
     const currentAdTypes = await listPortalAdTypes(client, id);
     const adTypesChanged = portalAdTypesSignature(currentAdTypes) !== portalAdTypesSignature(input.ad_types ?? []);
@@ -161,9 +191,18 @@ export async function updatePortal(id: number, input: PortalInput) {
       [id, input.name.trim(), slug, input.description ?? null, input.logo_url ?? null, input.active ?? true]
     );
     if (!result.rows[0]) return null;
+    if (existingPortal.rows[0]?.slug && existingPortal.rows[0].slug !== slug) {
+      await dropPortalFinalViewBySlug(client, existingPortal.rows[0].slug);
+    }
     await replacePortalAdTypes(client, id, input.ad_types ?? []);
+    const affectedPortalIds = new Set<number>([id]);
     if (adTypesChanged) {
-      await refreshRuleViewsForPortal(client, id);
+      for (const affectedPortalId of await refreshRuleViewsForPortal(client, id)) {
+        affectedPortalIds.add(affectedPortalId);
+      }
+    }
+    for (const affectedPortalId of affectedPortalIds) {
+      await refreshPortalFinalView(client, affectedPortalId);
     }
     return getPortalById(client, id);
   });
@@ -176,6 +215,8 @@ export async function deletePortal(id: number) {
 
   await ensureControlSchema();
   await withTransaction(async (client) => {
+    const portal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [id]);
+    if (portal.rows[0]?.slug) await dropPortalFinalViewBySlug(client, portal.rows[0].slug);
     await client.query("update publish_rules set portal_id = null, updated_at = now() where portal_id = $1", [id]);
     await client.query("delete from publish_portals where id = $1", [id]);
   });
@@ -244,7 +285,7 @@ export async function createRule(input: RuleInput) {
     const rule = inserted.rows[0];
     const viewPrefix = portal.rows[0].slug ? `${portal.rows[0].slug}_` : "";
     const viewName = `pc_${viewPrefix}${slug}_${rule.id}`.slice(0, 62);
-    return refreshRuleView(client, rule.id, viewName, {
+    const refreshed = await refreshRuleView(client, rule.id, viewName, {
       ...rule,
       filters,
       source_table: sourceTable,
@@ -255,6 +296,8 @@ export async function createRule(input: RuleInput) {
       publication_priority: publicationPriority,
       summary_config: summaryConfig
     });
+    if (portalId) await refreshPortalFinalView(client, portalId);
+    return refreshed;
   });
   invalidateHealthcheckReportCache();
   return rule;
@@ -269,6 +312,7 @@ export async function updateRule(id: number, input: RuleInput) {
     const existing = await client.query<PublicationRule>("select * from publish_rules where id = $1", [id]);
     if (!existing.rows[0]) return null;
 
+    const previousPortalId = existing.rows[0].portal_id;
     const portalId = input.portal_id === undefined ? existing.rows[0].portal_id : normalizePortalId(input.portal_id);
     if (portalId) {
       const portal = await client.query<{ id: number }>("select id from publish_portals where id = $1", [portalId]);
@@ -338,7 +382,10 @@ export async function updateRule(id: number, input: RuleInput) {
       publication_priority: publicationPriority,
       summary_config: summaryConfig
     });
-    await refreshDependentRuleViews(client, refreshed.view_name, new Set([id]));
+    const affectedPortalIds = await refreshDependentRuleViews(client, refreshed.view_name, new Set([id]));
+    for (const affectedPortalId of new Set([...affectedPortalIds, previousPortalId, portalId])) {
+      if (affectedPortalId) await refreshPortalFinalView(client, affectedPortalId);
+    }
     return refreshed;
   });
   invalidateHealthcheckReportCache();
@@ -373,14 +420,25 @@ export async function deleteRule(id: number) {
 
   await ensureControlSchema();
   await withTransaction(async (client) => {
-    const existing = await client.query<{ view_name: string | null }>(
-      "select view_name from publish_rules where id = $1",
+    const existing = await client.query<{ view_name: string | null; portal_id: number | null; portal_slug: string | null }>(
+      `
+        select r.view_name, r.portal_id, p.slug as portal_slug
+        from publish_rules r
+        left join publish_portals p on p.id = r.portal_id
+        where r.id = $1
+      `,
       [id]
     );
+    if (existing.rows[0]?.portal_slug) {
+      await dropPortalFinalViewBySlug(client, existing.rows[0].portal_slug);
+    }
     if (existing.rows[0]?.view_name) {
       await client.query(`drop view if exists public."${existing.rows[0].view_name.replace(/"/g, '""')}"`);
     }
     await client.query("delete from publish_rules where id = $1", [id]);
+    if (existing.rows[0]?.portal_id) {
+      await refreshPortalFinalView(client, existing.rows[0].portal_id);
+    }
   });
   invalidateHealthcheckReportCache();
 }
@@ -392,29 +450,45 @@ export async function runRuleHealthchecks(ruleId?: number | null): Promise<RuleH
     return statuses;
   }
 
-  await ensureControlSchema();
-  const result = await query<
-    Pick<
-      PublicationRule,
-      "id" | "portal_id" | "view_name" | "use_ad_limit" | "ad_limit_type"
-    > & { portal_slug: string | null }
-  >(
-    `
-      select r.id, r.portal_id, r.view_name, r.use_ad_limit, r.ad_limit_type, p.slug as portal_slug
-      from publish_rules r
-      left join publish_portals p on p.id = r.portal_id
-      ${ruleId ? "where r.id = $1" : ""}
-      order by r.updated_at desc, r.id desc
-    `,
-    ruleId ? [ruleId] : []
-  );
+  return enqueueHealthcheckRun(async () => runRuleHealthchecksDirect(ruleId));
+}
 
-  const statuses: RuleHealthcheckStatus[] = [];
-  for (const rule of result.rows) {
-    statuses.push(await runSingleRuleHealthcheck(rule));
+function enqueueHealthcheckRun<T>(callback: () => Promise<T>) {
+  const previousRun = healthcheckRunQueue.catch(() => undefined);
+  const queuedRun = previousRun.then(callback);
+  healthcheckRunQueue = queuedRun.catch(() => undefined);
+  return queuedRun;
+}
+
+async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHealthcheckStatus[]> {
+  await ensureControlSchema();
+  const client = await getPool().connect();
+  try {
+    const result = await client.query<
+      Pick<
+        PublicationRule,
+        "id" | "portal_id" | "view_name" | "use_ad_limit" | "ad_limit_type"
+      > & { portal_slug: string | null }
+    >(
+      `
+        select r.id, r.portal_id, r.view_name, r.use_ad_limit, r.ad_limit_type, p.slug as portal_slug
+        from publish_rules r
+        left join publish_portals p on p.id = r.portal_id
+        ${ruleId ? "where r.id = $1" : ""}
+        order by r.updated_at desc, r.id desc
+      `,
+      ruleId ? [ruleId] : []
+    );
+
+    const statuses: RuleHealthcheckStatus[] = [];
+    for (const rule of result.rows) {
+      statuses.push(await runSingleRuleHealthcheck(client, rule));
+    }
+    invalidateHealthcheckReportCache(ruleId);
+    return statuses;
+  } finally {
+    client.release();
   }
-  invalidateHealthcheckReportCache(ruleId);
-  return statuses;
 }
 
 export async function getRuleHealthcheckReport(options: { ruleId?: number | null; refresh?: boolean } = {}): Promise<RuleHealthcheckReport> {
@@ -452,7 +526,7 @@ export async function getRuleHealthcheckReport(options: { ruleId?: number | null
 
   let ruleHits = 0;
   let ruleMisses = 0;
-  const rules = await mapWithConcurrency(result.rows, 4, async (rule) => {
+  const rules = await mapWithConcurrency(result.rows, HEALTHCHECK_REPORT_RULE_CONCURRENCY, async (rule) => {
     const cacheKey = healthcheckReportRuleCacheKey(rule);
     const cached = options.refresh ? null : healthcheckReportRuleCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
@@ -1023,7 +1097,7 @@ async function listPortalsViaApi() {
   const [portals, rules, adTypes] = await Promise.all([
     dataApiRequest<Portal[]>("/publish_portals?order=name.asc"),
     dataApiRequest<Array<{ id: number; portal_id: number | null }>>("/publish_rules?select=id,portal_id"),
-    dataApiRequest<PortalAdType[]>("/publish_portal_ad_types?order=name.asc")
+    dataApiRequest<PortalAdType[]>("/publish_portal_ad_types?order=quantity.desc,tier.asc,id.asc")
   ]);
   const counts = new Map<number, number>();
   for (const rule of rules) {
@@ -1056,6 +1130,7 @@ async function createPortalViaApi(input: PortalInput) {
     }
   });
   await replacePortalAdTypesViaApi(rows[0].id, input.ad_types ?? []);
+  await refreshPortalFinalViewViaApi(rows[0].id);
   const portal = await getPortalByIdViaApi(rows[0].id);
   invalidateHealthcheckReportCache();
   return portal;
@@ -1063,7 +1138,10 @@ async function createPortalViaApi(input: PortalInput) {
 
 async function updatePortalViaApi(id: number, input: PortalInput) {
   const slug = normalizePortalSlug(input.slug, input.name);
-  const currentAdTypes = await dataApiRequest<PortalAdType[]>(`/publish_portal_ad_types?portal_id=eq.${id}&order=name.asc`);
+  const [currentPortal, currentAdTypes] = await Promise.all([
+    dataApiRequest<Array<Pick<Portal, "slug">>>(`/publish_portals?id=eq.${id}&select=slug&limit=1`),
+    dataApiRequest<PortalAdType[]>(`/publish_portal_ad_types?portal_id=eq.${id}&order=quantity.desc,tier.asc,id.asc`)
+  ]);
   const adTypesChanged = portalAdTypesSignature(currentAdTypes) !== portalAdTypesSignature(input.ad_types ?? []);
   const rows = await dataApiRequest<Portal[]>(`/publish_portals?id=eq.${id}`, {
     method: "PATCH",
@@ -1078,9 +1156,18 @@ async function updatePortalViaApi(id: number, input: PortalInput) {
     }
   });
   if (!rows[0]) return null;
+  if (currentPortal[0]?.slug && currentPortal[0].slug !== slug) {
+    await dropPortalFinalViewViaApi(currentPortal[0].slug);
+  }
   await replacePortalAdTypesViaApi(id, input.ad_types ?? []);
+  const affectedPortalIds = new Set<number>([id]);
   if (adTypesChanged) {
-    await refreshRuleViewsForPortalViaApi(id);
+    for (const affectedPortalId of await refreshRuleViewsForPortalViaApi(id)) {
+      affectedPortalIds.add(affectedPortalId);
+    }
+  }
+  for (const affectedPortalId of affectedPortalIds) {
+    await refreshPortalFinalViewViaApi(affectedPortalId);
   }
   const portal = await getPortalByIdViaApi(id);
   invalidateHealthcheckReportCache();
@@ -1088,6 +1175,8 @@ async function updatePortalViaApi(id: number, input: PortalInput) {
 }
 
 async function deletePortalViaApi(id: number) {
+  const portal = await dataApiRequest<Array<Pick<Portal, "slug">>>(`/publish_portals?id=eq.${id}&select=slug&limit=1`);
+  if (portal[0]?.slug) await dropPortalFinalViewViaApi(portal[0].slug);
   await dataApiRequest(`/publish_rules?portal_id=eq.${id}`, { method: "PATCH", body: { portal_id: null } });
   await dataApiRequest(`/publish_portals?id=eq.${id}`, { method: "DELETE" });
   invalidateHealthcheckReportCache();
@@ -1143,6 +1232,7 @@ async function createRuleViaApi(input: RuleInput) {
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", {
     rule_id: inserted[0].id
   });
+  if (portalId) await refreshPortalFinalViewViaApi(portalId);
   invalidateHealthcheckReportCache();
   return refreshed[0];
 }
@@ -1163,6 +1253,7 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
       : sanitizeRuleSummaryConfig(input.summary_config, columns);
   const sourceTable = await validateSourceTableViaApi(input.source_table ?? existing[0].source_table, id);
   const portalId = input.portal_id === undefined ? existing[0].portal_id : normalizePortalId(input.portal_id);
+  const previousPortalId = existing[0].portal_id;
   if (portalId) await assertPortalExistsViaApi(portalId);
   const adLimit = await normalizeRuleAdLimitViaApi(
     portalId,
@@ -1191,7 +1282,10 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
 
   if (!updated[0]) return null;
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", { rule_id: id });
-  await refreshDependentRuleViewsViaApi(refreshed[0]?.view_name ?? null, new Set([id]));
+  const affectedPortalIds = await refreshDependentRuleViewsViaApi(refreshed[0]?.view_name ?? null, new Set([id]));
+  for (const affectedPortalId of new Set([...affectedPortalIds, previousPortalId, portalId])) {
+    if (affectedPortalId) await refreshPortalFinalViewViaApi(affectedPortalId);
+  }
   invalidateHealthcheckReportCache();
   return refreshed[0];
 }
@@ -1212,8 +1306,14 @@ async function updateRuleSummaryConfigViaApi(id: number, summaryConfigInput: unk
 }
 
 async function deleteRuleViaApi(id: number) {
+  const existing = await dataApiRequest<Array<Pick<PublicationRule, "portal_id">>>(`/publish_rules?id=eq.${id}&select=portal_id&limit=1`);
+  const existingPortal = existing[0]?.portal_id
+    ? await dataApiRequest<Array<Pick<Portal, "slug">>>(`/publish_portals?id=eq.${existing[0].portal_id}&select=slug&limit=1`)
+    : [];
+  if (existingPortal[0]?.slug) await dropPortalFinalViewViaApi(existingPortal[0].slug);
   await dataApiRpc<PublicationRule[]>("drop_publish_rule_view", { rule_id: id });
   await dataApiRequest(`/publish_rules?id=eq.${id}`, { method: "DELETE" });
+  if (existing[0]?.portal_id) await refreshPortalFinalViewViaApi(existing[0].portal_id);
   invalidateHealthcheckReportCache();
 }
 
@@ -1327,29 +1427,31 @@ async function listBaseColumnsViaApi() {
 
 async function listPortalAdTypes(client: PoolClient, portalId: number) {
   const result = await client.query<PortalAdType>(
-    "select id, portal_id, name, quantity, created_at, updated_at from publish_portal_ad_types where portal_id = $1 order by name",
+    "select id, portal_id, name, slug, quantity, tier, created_at, updated_at from publish_portal_ad_types where portal_id = $1 order by quantity desc, tier asc, id asc",
     [portalId]
   );
   return result.rows;
 }
 
 function portalAdTypesSignature(adTypes: PortalAdTypeInput[] | PortalAdType[]) {
-  return JSON.stringify(sanitizeAdTypes(adTypes).sort((left, right) => left.name.localeCompare(right.name, "pt-BR")));
+  return JSON.stringify(sanitizeAdTypes(adTypes).sort((left, right) => left.slug.localeCompare(right.slug, "pt-BR")));
 }
 
 async function refreshRuleViewsForPortal(client: PoolClient, portalId: number) {
   const rules = await listRefreshableRules(client);
   const seedIds = rules.filter((rule) => rule.portal_id === portalId).map((rule) => rule.id);
-  await refreshRuleViewsBySeedIds(client, seedIds, rules);
+  const affectedPortalIds = await refreshRuleViewsBySeedIds(client, seedIds, rules);
+  affectedPortalIds.add(portalId);
+  return affectedPortalIds;
 }
 
 async function refreshDependentRuleViews(client: PoolClient, sourceViewName: string | null, ignoredIds = new Set<number>()) {
-  if (!sourceViewName) return;
+  if (!sourceViewName) return new Set<number>();
   const rules = await listRefreshableRules(client);
   const seedIds = rules
     .filter((rule) => rule.source_table === sourceViewName && !ignoredIds.has(rule.id))
     .map((rule) => rule.id);
-  await refreshRuleViewsBySeedIds(client, seedIds, rules);
+  return refreshRuleViewsBySeedIds(client, seedIds, rules);
 }
 
 async function listRefreshableRules(client: PoolClient) {
@@ -1358,7 +1460,8 @@ async function listRefreshableRules(client: PoolClient) {
 }
 
 async function refreshRuleViewsBySeedIds(client: PoolClient, seedIds: number[], rules: PublicationRule[]) {
-  if (!seedIds.length) return;
+  const affectedPortalIds = new Set<number>();
+  if (!seedIds.length) return affectedPortalIds;
 
   const rulesById = new Map(rules.map((rule) => [rule.id, rule]));
   const viewToRuleId = new Map<string, number>();
@@ -1398,6 +1501,7 @@ async function refreshRuleViewsBySeedIds(client: PoolClient, seedIds: number[], 
       const refreshed = await refreshRuleView(client, rule.id, rule.view_name, rule);
       rulesById.set(rule.id, { ...rule, ...refreshed });
       if (refreshed.view_name) viewToRuleId.set(refreshed.view_name, refreshed.id);
+      if (refreshed.portal_id) affectedPortalIds.add(refreshed.portal_id);
       pending.delete(ruleId);
       progressed = true;
     }
@@ -1410,28 +1514,34 @@ async function refreshRuleViewsBySeedIds(client: PoolClient, seedIds: number[], 
         const refreshed = await refreshRuleView(client, rule.id, rule.view_name, rule);
         rulesById.set(rule.id, { ...rule, ...refreshed });
         if (refreshed.view_name) viewToRuleId.set(refreshed.view_name, refreshed.id);
+        if (refreshed.portal_id) affectedPortalIds.add(refreshed.portal_id);
       }
     }
   }
+
+  return affectedPortalIds;
 }
 
 async function refreshRuleViewsForPortalViaApi(portalId: number) {
   const rules = await dataApiRequest<PublicationRule[]>("/publish_rules?order=id.asc");
   const seedIds = rules.filter((rule) => rule.portal_id === portalId).map((rule) => rule.id);
-  await refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
+  const affectedPortalIds = await refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
+  affectedPortalIds.add(portalId);
+  return affectedPortalIds;
 }
 
 async function refreshDependentRuleViewsViaApi(sourceViewName: string | null, ignoredIds = new Set<number>()) {
-  if (!sourceViewName) return;
+  if (!sourceViewName) return new Set<number>();
   const rules = await dataApiRequest<PublicationRule[]>("/publish_rules?order=id.asc");
   const seedIds = rules
     .filter((rule) => rule.source_table === sourceViewName && !ignoredIds.has(rule.id))
     .map((rule) => rule.id);
-  await refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
+  return refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
 }
 
 async function refreshRuleViewsBySeedIdsViaApi(seedIds: number[], rules: PublicationRule[]) {
-  if (!seedIds.length) return;
+  const affectedPortalIds = new Set<number>();
+  if (!seedIds.length) return affectedPortalIds;
 
   const rulesById = new Map(rules.map((rule) => [rule.id, rule]));
   const viewToRuleId = new Map<string, number>();
@@ -1473,6 +1583,7 @@ async function refreshRuleViewsBySeedIdsViaApi(seedIds: number[], rules: Publica
       if (refreshedRule) {
         rulesById.set(rule.id, { ...rule, ...refreshedRule });
         if (refreshedRule.view_name) viewToRuleId.set(refreshedRule.view_name, refreshedRule.id);
+        if (refreshedRule.portal_id) affectedPortalIds.add(refreshedRule.portal_id);
       }
       pending.delete(ruleId);
       progressed = true;
@@ -1488,10 +1599,21 @@ async function refreshRuleViewsBySeedIdsViaApi(seedIds: number[], rules: Publica
         if (refreshedRule) {
           rulesById.set(rule.id, { ...rule, ...refreshedRule });
           if (refreshedRule.view_name) viewToRuleId.set(refreshedRule.view_name, refreshedRule.id);
+          if (refreshedRule.portal_id) affectedPortalIds.add(refreshedRule.portal_id);
         }
       }
     }
   }
+
+  return affectedPortalIds;
+}
+
+async function refreshPortalFinalViewViaApi(portalId: number) {
+  await dataApiRpc<{ view_name: string }[]>("refresh_publish_portal_final_view", { portal_id: portalId });
+}
+
+async function dropPortalFinalViewViaApi(portalSlug: string) {
+  await dataApiRpc<{ ok: boolean }[]>("drop_publish_portal_final_view", { portal_slug: portalSlug });
 }
 
 async function assertPortalExistsViaApi(portalId: number) {
@@ -1602,12 +1724,12 @@ function normalizePortalSlug(slug: string | null | undefined, fallbackName: stri
 }
 
 function normalizeAdLimitType(adLimitType?: string | null) {
-  const normalized = normalizeAdTypeName(adLimitType || "total");
+  const normalized = normalizeAdTypeSlug(adLimitType || "total");
   return normalized || "total";
 }
 
 function adLimitTypeSlug(adLimitType: string) {
-  return slugify(normalizeAdTypeName(adLimitType));
+  return normalizeAdTypeSlug(adLimitType);
 }
 
 async function normalizeRuleAdLimit(
@@ -1622,7 +1744,7 @@ async function normalizeRuleAdLimit(
   const normalizedType = normalizeAdLimitType(adLimitType);
   if (normalizedType !== "total") {
     const result = await client.query<{ exists: boolean }>(
-      "select exists (select 1 from publish_portal_ad_types where portal_id = $1 and name = $2) as exists",
+      "select exists (select 1 from publish_portal_ad_types where portal_id = $1 and slug = $2) as exists",
       [portalId, normalizedType]
     );
     if (!result.rows[0]?.exists) throw new Error("Tipo de anuncio nao encontrado para este portal.");
@@ -1642,7 +1764,7 @@ async function normalizeRuleAdLimitViaApi(
   const normalizedType = normalizeAdLimitType(adLimitType);
   if (normalizedType !== "total") {
     const rows = await dataApiRequest<Array<Pick<PortalAdType, "id">>>(
-      `/publish_portal_ad_types?portal_id=eq.${portalId}&name=eq.${encodeURIComponent(normalizedType)}&select=id&limit=1`
+      `/publish_portal_ad_types?portal_id=eq.${portalId}&slug=eq.${encodeURIComponent(normalizedType)}&select=id&limit=1`
     );
     if (!rows[0]) throw new Error("Tipo de anuncio nao encontrado para este portal.");
   }
@@ -1659,21 +1781,58 @@ async function getAdLimitQuota(client: PoolClient, portalId: number | null, adLi
   return result.rows[0]?.quota ?? 0;
 }
 
-function sanitizeAdTypes(adTypes: PortalAdTypeInput[]) {
-  const normalized = new Map<string, number>();
-  for (const adType of adTypes) {
+function sanitizeAdTypes(adTypes: Array<PortalAdTypeInput | PortalAdType>) {
+  const normalized = new Map<string, { name: string; slug: string; quantity: number; tier: number }>();
+  for (const [index, adType] of adTypes.entries()) {
     const name = normalizeAdTypeName(adType.name);
     if (!name) continue;
+    const slug = normalizeAdTypeSlug(name);
 
     const quantity = Math.max(0, Math.trunc(Number(adType.quantity) || 0));
-    normalized.set(name, (normalized.get(name) ?? 0) + quantity);
+    const tier = normalizeAdTypeTier(adType.tier ?? index + 1);
+    const current = normalized.get(slug);
+    normalized.set(slug, {
+      name: current?.name ?? name,
+      slug,
+      quantity: (current?.quantity ?? 0) + quantity,
+      tier: current?.tier ?? tier
+    });
   }
 
-  return [...normalized.entries()].map(([name, quantity]) => ({ name, quantity }));
+  const cleanAdTypes = [...normalized.values()];
+  if (cleanAdTypes.length > 10) throw new Error("Um portal pode ter no maximo 10 tipos de anuncio.");
+
+  const tiers = new Set<number>();
+  for (const adType of cleanAdTypes) {
+    if (tiers.has(adType.tier)) throw new Error("Nao e permitido repetir o mesmo tier de anuncio para o mesmo portal.");
+    tiers.add(adType.tier);
+  }
+
+  return cleanAdTypes.sort(comparePortalAdTypesByQuantity);
 }
 
 function normalizeAdTypeName(name: string) {
   return name.normalize("NFC").replace(/\s+/g, " ").trim().toLocaleLowerCase("pt-BR");
+}
+
+function normalizeAdTypeSlug(name: string) {
+  return slugify(normalizeAdTypeName(name));
+}
+
+function normalizeAdTypeTier(value?: number | string | null) {
+  const tier = Number(value);
+  if (!Number.isInteger(tier) || tier < 1 || tier > 10) {
+    throw new Error("Tier do anuncio deve ser um numero de 1 a 10.");
+  }
+  return tier;
+}
+
+function comparePortalAdTypesByQuantity<T extends Pick<PortalAdType, "name" | "quantity" | "tier">>(left: T, right: T) {
+  const quantityDelta = (Number(right.quantity) || 0) - (Number(left.quantity) || 0);
+  if (quantityDelta !== 0) return quantityDelta;
+  const tierDelta = (Number(left.tier) || 0) - (Number(right.tier) || 0);
+  if (tierDelta !== 0) return tierDelta;
+  return left.name.localeCompare(right.name, "pt-BR");
 }
 
 async function replacePortalAdTypes(client: PoolClient, portalId: number, adTypes: PortalAdTypeInput[]) {
@@ -1681,10 +1840,10 @@ async function replacePortalAdTypes(client: PoolClient, portalId: number, adType
   for (const adType of sanitizeAdTypes(adTypes)) {
     await client.query(
       `
-        insert into publish_portal_ad_types (portal_id, name, quantity)
-        values ($1, $2, $3)
+        insert into publish_portal_ad_types (portal_id, name, slug, quantity, tier)
+        values ($1, $2, $3, $4, $5)
       `,
-      [portalId, adType.name, adType.quantity]
+      [portalId, adType.name, adType.slug, adType.quantity, adType.tier]
     );
   }
 }
@@ -1701,10 +1860,13 @@ async function getPortalById(client: PoolClient, portalId: number) {
               'id', a.id,
               'portal_id', a.portal_id,
               'name', a.name,
+              'slug', a.slug,
               'quantity', a.quantity,
+              'tier', a.tier,
               'created_at', a.created_at,
               'updated_at', a.updated_at
             )
+            order by a.quantity desc, a.tier asc, a.id asc
           ) filter (where a.id is not null),
           '[]'::jsonb
         ) as ad_types
@@ -1729,7 +1891,9 @@ async function replacePortalAdTypesViaApi(portalId: number, adTypes: PortalAdTyp
     body: cleanAdTypes.map((adType) => ({
       portal_id: portalId,
       name: adType.name,
-      quantity: adType.quantity
+      slug: adType.slug,
+      quantity: adType.quantity,
+      tier: adType.tier
     }))
   });
 }
@@ -1738,7 +1902,7 @@ async function getPortalByIdViaApi(portalId: number) {
   const [portals, rules, adTypes] = await Promise.all([
     dataApiRequest<Portal[]>(`/publish_portals?id=eq.${portalId}&limit=1`),
     dataApiRequest<Array<{ id: number; portal_id: number }>>(`/publish_rules?portal_id=eq.${portalId}&select=id,portal_id`),
-    dataApiRequest<PortalAdType[]>(`/publish_portal_ad_types?portal_id=eq.${portalId}&order=name.asc`)
+    dataApiRequest<PortalAdType[]>(`/publish_portal_ad_types?portal_id=eq.${portalId}&order=quantity.desc,tier.asc,id.asc`)
   ]);
   if (!portals[0]) return null;
   return {
@@ -1757,11 +1921,341 @@ function groupAdTypesByPortal(adTypes: PortalAdType[]) {
     current.push(adType);
     result.set(adType.portal_id, current);
   }
+  for (const [portalId, portalAdTypes] of result) {
+    result.set(portalId, portalAdTypes.sort(comparePortalAdTypesByQuantity));
+  }
   return result;
 }
 
 function sumPortalQuota(adTypes: PortalAdType[]) {
   return adTypes.reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
+}
+
+type PortalFinalCandidateRule = {
+  rule_id: number;
+  view_name: string;
+  candidate_ad_type_slug: string | null;
+  candidate_tier: number | null;
+  has_rule_index?: boolean;
+};
+
+type PortalFinalAdType = {
+  ad_type_name: string;
+  ad_type_slug: string;
+  tier: number;
+  quantity: number;
+};
+
+function portalFinalViewName(portalSlug: string) {
+  const viewName = `pc_${portalSlug}_final`;
+  if (!/^pc_[a-z0-9_]+_final$/.test(viewName) || viewName.length > 63) {
+    throw new Error(`Nome de view final invalido: ${viewName}`);
+  }
+  return viewName;
+}
+
+async function dropPortalFinalViewBySlug(client: PoolClient, portalSlug: string) {
+  if (!portalSlug) return;
+  await dropPortalFinalRelation(client, portalFinalViewName(portalSlug));
+}
+
+async function dropPortalFinalRelation(client: PoolClient, relationName: string) {
+  const relation = await client.query<{ relkind: string }>(
+    `
+      select c.relkind
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public'
+        and c.relname = $1
+        and c.relkind in ('v', 'm')
+      limit 1
+    `,
+    [relationName]
+  );
+  const relkind = relation.rows[0]?.relkind;
+  if (relkind === "m") {
+    await client.query(`drop materialized view if exists public.${quoteIdentifier(relationName)}`);
+  } else if (relkind === "v") {
+    await client.query(`drop view if exists public.${quoteIdentifier(relationName)}`);
+  }
+}
+
+async function listRelationColumns(client: PoolClient, relationName: string) {
+  const result = await client.query<{ column_name: string }>(
+    `
+      select a.attname as column_name
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      join pg_attribute a on a.attrelid = c.oid
+      where n.nspname = 'public'
+        and c.relkind in ('r', 'v', 'm')
+        and c.relname = $1
+        and a.attnum > 0
+        and not a.attisdropped
+      order by a.attnum
+    `,
+    [relationName]
+  );
+  return result.rows.map((row) => row.column_name);
+}
+
+async function listPublishSelectableColumns(client: PoolClient, relationName: string) {
+  const columns = await listRelationColumns(client, relationName);
+  const selectable = columns.filter((column) => !FINAL_VIEW_RESERVED_COLUMNS.has(column));
+  if (!selectable.length) throw new Error(`Nenhuma coluna publicavel encontrada em ${relationName}.`);
+  return selectable;
+}
+
+async function listPortalFinalColumns(client: PoolClient, viewNames: string[]) {
+  const relationNames = viewNames.length ? viewNames : ["base_imoveis"];
+  const allColumns: string[][] = [];
+  for (const relationName of relationNames) {
+    allColumns.push(await listPublishSelectableColumns(client, relationName));
+  }
+
+  const commonColumns = allColumns[0].filter((column) => allColumns.every((columns) => columns.includes(column)));
+  const missingColumns = FINAL_VIEW_REQUIRED_COLUMNS.filter((column) => !commonColumns.includes(column));
+  if (missingColumns.length) {
+    throw new Error(`As views candidatas precisam expor ${missingColumns.join(", ")} para consolidacao final.`);
+  }
+  return FINAL_VIEW_REQUIRED_COLUMNS;
+}
+
+async function listPortalFinalAdTypes(client: PoolClient, portalId: number): Promise<PortalFinalAdType[]> {
+  const result = await client.query<PortalFinalAdType>(
+    `
+      select a.name as ad_type_name,
+             a.slug as ad_type_slug,
+             a.tier,
+             a.quantity
+      from publish_portal_ad_types a
+      where a.portal_id = $1
+      order by a.tier desc, a.slug asc
+    `,
+    [portalId]
+  );
+  return result.rows;
+}
+
+async function listPortalFinalCandidateRules(client: PoolClient, portalId: number) {
+  const result = await client.query<PortalFinalCandidateRule>(
+    `
+      select r.id as rule_id,
+             r.view_name,
+             case
+               when r.use_ad_limit = true
+                and coalesce(r.ad_limit_type, '') <> ''
+                and r.ad_limit_type <> 'total'
+               then a.slug
+               else null
+             end as candidate_ad_type_slug,
+             case
+               when r.use_ad_limit = true
+                and coalesce(r.ad_limit_type, '') <> ''
+                and r.ad_limit_type <> 'total'
+               then a.tier
+               else null
+             end as candidate_tier
+      from publish_rules r
+      left join publish_portal_ad_types a
+        on a.portal_id = r.portal_id
+       and a.slug = r.ad_limit_type
+      where r.portal_id = $1
+        and r.active = true
+        and r.view_name is not null
+        and r.use_ad_limit = true
+        and coalesce(r.ad_limit_type, '') <> ''
+        and r.ad_limit_type <> 'total'
+        and a.slug is not null
+      order by
+        case
+          when r.use_ad_limit = true
+           and coalesce(r.ad_limit_type, '') <> ''
+           and r.ad_limit_type <> 'total'
+          then coalesce(a.tier, -2147483648)
+          else -2147483648
+        end desc,
+        r.id asc
+    `,
+    [portalId]
+  );
+  return result.rows.filter((rule): rule is PortalFinalCandidateRule & { view_name: string } => Boolean(rule.view_name));
+}
+
+function quotedColumnList(columns: string[], alias?: string) {
+  return columns.map((column) => `${alias ? `${quoteIdentifier(alias)}.` : ""}${quoteIdentifier(column)}`).join(", ");
+}
+
+function buildEmptyPortalFinalViewSql(viewName: string, columns: string[]) {
+  return `create materialized view public.${quoteIdentifier(viewName)} as
+select ${quotedColumnList(columns, "b")},
+  null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+  null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+  null::integer as ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+  null::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)}
+from public.base_imoveis b
+where false`;
+}
+
+function portalFinalAdTypeValuesSql(adTypes: PortalFinalAdType[]) {
+  return adTypes
+    .map((adType) => `(
+    ${quoteLiteral(adType.ad_type_name)}::text,
+    ${quoteLiteral(adType.ad_type_slug)}::text,
+    ${Math.trunc(Number(adType.tier) || 0)}::integer,
+    ${Math.max(0, Math.trunc(Number(adType.quantity) || 0))}::integer
+  )`)
+    .join(",\n  ");
+}
+
+function buildPortalFinalViewSql(
+  viewName: string,
+  candidateRules: PortalFinalCandidateRule[],
+  adTypes: PortalFinalAdType[],
+  columns: string[]
+) {
+  if (!candidateRules.length || !adTypes.length) return buildEmptyPortalFinalViewSql(viewName, columns);
+
+  const candidateColumnSql = quotedColumnList(columns, "b");
+  const eligibleColumnSql = quotedColumnList(columns, "c");
+  const finalColumnSql = quotedColumnList(columns);
+  const candidateSql = candidateRules
+    .map((rule, index) => {
+      const ruleIndexSql = rule.has_rule_index
+        ? `coalesce(b.${quoteIdentifier(RULE_INDEX_COLUMN)}, 2147483647)::integer`
+        : "row_number() over ()::integer";
+      return `select ${index}::integer as ${quoteIdentifier("__allocation_rule_order")},
+  ${rule.candidate_ad_type_slug ? quoteLiteral(rule.candidate_ad_type_slug) : "null"}::text as ${quoteIdentifier("__candidate_ad_type_slug")},
+  ${rule.candidate_tier == null ? "null" : Math.trunc(Number(rule.candidate_tier) || 0)}::integer as ${quoteIdentifier("__candidate_tier")},
+  ${ruleIndexSql} as ${quoteIdentifier(RULE_INDEX_COLUMN)},
+  ${candidateColumnSql}
+from public.${quoteIdentifier(rule.view_name)} b
+where b.codigo_crm is not null`;
+    })
+    .join("\nunion all\n");
+
+  const allocatedCtes: string[] = [];
+  const allocatedNames: string[] = [];
+  for (const [index, adType] of adTypes.entries()) {
+    const cteName = `allocated_${index}`;
+    const exclusions = allocatedNames
+      .map((previousCte) => `and not exists (select 1 from ${quoteIdentifier(previousCte)} previous where previous.codigo_crm = d.codigo_crm)`)
+      .join("\n  ");
+    allocatedCtes.push(`${quoteIdentifier(cteName)} as (
+  select *
+  from deduped d
+  where d.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adType.ad_type_slug)}
+    ${exclusions}
+  order by d.${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
+    d.${quoteIdentifier("__allocation_rule_order")} asc
+  limit ${Math.max(0, Math.trunc(Number(adType.quantity) || 0))}
+)`);
+    allocatedNames.push(cteName);
+  }
+
+  return `create materialized view public.${quoteIdentifier(viewName)} as
+with ad_types(${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}, quantity) as (
+  values
+  ${portalFinalAdTypeValuesSql(adTypes)}
+),
+candidates as (
+${candidateSql}
+),
+eligible as (
+  select c.${quoteIdentifier("__allocation_rule_order")},
+    a.${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+    a.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+    a.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+    case
+      when c.${quoteIdentifier("__candidate_ad_type_slug")} = a.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} then 0
+      when c.${quoteIdentifier("__candidate_ad_type_slug")} is null then 2
+      else 1
+    end::integer as ${quoteIdentifier("__allocation_match_rank")},
+    abs(coalesce(c.${quoteIdentifier("__candidate_tier")}, a.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}) - a.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)})::integer as ${quoteIdentifier("__allocation_tier_distance")},
+    c.${quoteIdentifier("__candidate_tier")},
+    c.${quoteIdentifier(RULE_INDEX_COLUMN)},
+    ${eligibleColumnSql}
+  from candidates c
+  join ad_types a
+    on c.${quoteIdentifier("__candidate_ad_type_slug")} = a.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}
+),
+deduped as (
+  select *
+  from (
+    select eligible.*,
+      row_number() over (
+        partition by codigo_crm, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}
+        order by ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
+          ${quoteIdentifier("__allocation_rule_order")} asc
+      ) as ${quoteIdentifier("__ad_type_duplicate_rank")}
+    from eligible
+  ) ranked
+  where ${quoteIdentifier("__ad_type_duplicate_rank")} = 1
+),
+${allocatedCtes.join(",\n")},
+final_allocation as (
+  ${allocatedNames.map((cteName) => `select * from ${quoteIdentifier(cteName)}`).join("\n  union all\n  ")}
+)
+select ${finalColumnSql},
+  ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+  ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+  ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+  row_number() over (
+    order by ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc,
+      ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
+      ${quoteIdentifier("__allocation_rule_order")} asc,
+      ${quoteIdentifier("__allocation_match_rank")} asc,
+      ${quoteIdentifier("__allocation_tier_distance")} asc
+  )::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)}
+from final_allocation
+order by ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc,
+  ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
+  ${quoteIdentifier("__allocation_rule_order")} asc,
+  ${quoteIdentifier("__allocation_match_rank")} asc,
+  ${quoteIdentifier("__allocation_tier_distance")} asc`;
+}
+
+async function createPortalFinalIndexes(client: PoolClient, viewName: string, columns: string[]) {
+  const hasCodigoCrm = columns.includes("codigo_crm");
+  await client.query(
+    `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)})`
+  );
+  await client.query(
+    `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)})`
+  );
+  if (hasCodigoCrm) {
+    await client.query(
+      `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier("codigo_crm")})`
+    );
+    await client.query(
+      `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier("codigo_crm")})`
+    );
+  }
+  await client.query(`grant select on public.${quoteIdentifier(viewName)} to service_role`);
+}
+
+async function refreshPortalFinalView(client: PoolClient, portalId: number) {
+  const portal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [portalId]);
+  if (!portal.rows[0]?.slug) return null;
+
+  const viewName = portalFinalViewName(portal.rows[0].slug);
+  const [candidateRules, adTypes] = await Promise.all([
+    listPortalFinalCandidateRules(client, portalId),
+    listPortalFinalAdTypes(client, portalId)
+  ]);
+  const candidateRulesWithIndex: Array<PortalFinalCandidateRule & { view_name: string; has_rule_index: boolean }> = [];
+  for (const rule of candidateRules) {
+    candidateRulesWithIndex.push({
+      ...rule,
+      has_rule_index: (await listRelationColumns(client, rule.view_name)).includes(RULE_INDEX_COLUMN)
+    });
+  }
+  const columns = await listPortalFinalColumns(client, candidateRules.map((rule) => rule.view_name));
+  const sql = buildPortalFinalViewSql(viewName, candidateRulesWithIndex, adTypes, columns);
+  await dropPortalFinalRelation(client, viewName);
+  await client.query(sql);
+  await createPortalFinalIndexes(client, viewName, columns);
+  return { viewName, sql };
 }
 
 const HEALTHCHECK_REVERSE_SOURCE_TABLE = "imoveis_ativos";
@@ -1850,27 +2344,31 @@ function healthcheckPublishedPredicate(alias: string, portalSlug: string, adType
 }
 
 function healthcheckPendingQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
-  if (!rule.view_name) return null;
+  if (!rule.portal_slug) return null;
   const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  const finalViewName = portalFinalViewName(rule.portal_slug);
   return `
 select b.codigo_crm::text as codigo_crm
-from public.${quoteIdentifier(rule.view_name)} b
-where not (${healthcheckPublishedPredicate("b", rule.portal_slug, adTypeSlug, shouldFilterType)})
-order by b.codigo_crm
+from public.${quoteIdentifier(finalViewName)} b
+where ${shouldFilterType ? `b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adTypeSlug)} and ` : ""}not (${healthcheckPublishedPredicate("b", rule.portal_slug, adTypeSlug, shouldFilterType)})
+order by b.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)} asc nulls last,
+  b.codigo_crm asc
 `.trim();
 }
 
 function healthcheckUnexpectedQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
-  if (!rule.view_name) return null;
+  if (!rule.portal_slug) return null;
   const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  const finalViewName = portalFinalViewName(rule.portal_slug);
   return `
 select ia.codigo_crm::text as codigo_crm
 from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
 where ${healthcheckPublishedPredicate("ia", rule.portal_slug, adTypeSlug, shouldFilterType)}
   and not exists (
     select 1
-    from public.${quoteIdentifier(rule.view_name)} p
+    from public.${quoteIdentifier(finalViewName)} p
     where p.codigo_crm = ia.codigo_crm
+      ${shouldFilterType ? `and p.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adTypeSlug)}` : ""}
   )
 order by ia.codigo_crm
 `.trim();
@@ -1910,10 +2408,6 @@ async function buildHealthcheckReportRule(rule: HealthcheckReportRuleRow): Promi
     },
     error: rule.health_error
   };
-
-  if (!rule.view_name) {
-    return { ...baseReport, error: baseReport.error ?? "View da regra ainda nao foi criada." };
-  }
 
   const pendingQuery = healthcheckPendingQuery(rule, adType.slug);
   const unexpectedQuery = healthcheckUnexpectedQuery(rule, adType.slug);
@@ -1960,19 +2454,17 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleHealthcheckStatus> {
+async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRuleRow): Promise<RuleHealthcheckStatus> {
   const checkedAt = new Date().toISOString();
 
   try {
     if (!rule.portal_id || !rule.portal_slug) {
-      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "Regra sem portal vinculado.");
+      return updateRuleHealthcheckStatus(client, rule, null, null, null, null, checkedAt, "Regra sem portal vinculado.");
     }
 
-    if (!rule.view_name) {
-      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "View da regra ainda nao foi criada.");
-    }
+    const finalViewName = portalFinalViewName(rule.portal_slug);
 
-    const viewExists = await query<{ exists: boolean }>(
+    const viewExists = await client.query<{ exists: boolean }>(
       `
         select exists (
           select 1
@@ -1983,37 +2475,47 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
             and c.relname = $1
         ) as exists
       `,
-      [rule.view_name]
+      [finalViewName]
     );
     if (!viewExists.rows[0]?.exists) {
-      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "View da regra nao encontrada.");
+      return updateRuleHealthcheckStatus(client, rule, null, null, null, null, checkedAt, "View final do portal nao encontrada.");
     }
 
-    const hasPublicationPortals = await query<{ exists: boolean }>(
+    const finalViewReady = await client.query<{ ready: boolean }>(
       `
-        select exists (
+        select not exists (
           select 1
-          from information_schema.columns
-          where table_schema = 'public'
-            and table_name = $1
-            and column_name = 'publicacao_portais'
-        ) as exists
+          from (values ('publicacao_portais'), ('codigo_crm'), ($2), ($3)) as required(column_name)
+          where not exists (
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid
+            where n.nspname = 'public'
+              and c.relkind in ('v', 'm')
+              and c.relname = $1
+              and a.attnum > 0
+              and not a.attisdropped
+              and a.attname = required.column_name
+          )
+        ) as ready
       `,
-      [rule.view_name]
+      [finalViewName, FINAL_VIEW_AD_TYPE_SLUG_COLUMN, FINAL_VIEW_PUBLICATION_RANK_COLUMN]
     );
-    if (!hasPublicationPortals.rows[0]?.exists) {
+    if (!finalViewReady.rows[0]?.ready) {
       return updateRuleHealthcheckStatus(
+        client,
         rule,
         null,
         null,
         null,
         null,
         checkedAt,
-        "Coluna publicacao_portais nao encontrada na view da regra."
+        "View final do portal sem codigo_crm, publicacao_portais, ad_type_slug ou publication_rank."
       );
     }
 
-    const reverseSourceReady = await query<{ ready: boolean }>(
+    const reverseSourceReady = await client.query<{ ready: boolean }>(
       `
         select exists (
           select 1
@@ -2023,32 +2525,28 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
             and c.relkind in ('r', 'v', 'm')
             and c.relname = $1
         )
-        and exists (
+        and not exists (
           select 1
-          from information_schema.columns
-          where table_schema = 'public'
-            and table_name = $1
-            and column_name = 'publicacao_portais'
-        )
-        and exists (
-          select 1
-          from information_schema.columns
-          where table_schema = 'public'
-            and table_name = $1
-            and column_name = 'codigo_crm'
-        )
-        and exists (
-          select 1
-          from information_schema.columns
-          where table_schema = 'public'
-            and table_name = $2
-            and column_name = 'codigo_crm'
+          from (values ($1, 'publicacao_portais'), ($1, 'codigo_crm'), ($2, 'codigo_crm')) as required(table_name, column_name)
+          where not exists (
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid
+            where n.nspname = 'public'
+              and c.relkind in ('r', 'v', 'm')
+              and c.relname = required.table_name
+              and a.attnum > 0
+              and not a.attisdropped
+              and a.attname = required.column_name
+          )
         ) as ready
       `,
-      [HEALTHCHECK_REVERSE_SOURCE_TABLE, rule.view_name]
+      [HEALTHCHECK_REVERSE_SOURCE_TABLE, finalViewName]
     );
     if (!reverseSourceReady.rows[0]?.ready) {
       return updateRuleHealthcheckStatus(
+        client,
         rule,
         null,
         null,
@@ -2059,23 +2557,29 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
       );
     }
 
-    const expected = await query<{ count: number }>(
-      `select count(*)::int as count from public.${quoteIdentifier(rule.view_name)}`
-    );
-    const expectedCount = expected.rows[0]?.count ?? 0;
     const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
     const adLimitTypeFilter = shouldFilterType && rule.ad_limit_type ? adLimitTypeSlug(rule.ad_limit_type) : null;
-    const published = await query<{ count: number }>(
+    const expected = await client.query<{ count: number }>(
       `
         select count(*)::int as count
-        from public.${quoteIdentifier(rule.view_name)} b
+        from public.${quoteIdentifier(finalViewName)} b
+        ${shouldFilterType ? `where b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $1` : ""}
+      `,
+      shouldFilterType ? [adLimitTypeFilter] : []
+    );
+    const expectedCount = expected.rows[0]?.count ?? 0;
+    const published = await client.query<{ count: number }>(
+      `
+        select count(*)::int as count
+        from public.${quoteIdentifier(finalViewName)} b
         where coalesce((b.publicacao_portais::jsonb -> $1 ->> 'publicado')::boolean, false) is true
+        ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
         ${shouldFilterType ? "and b.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
       `,
       shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
     );
     const publishedCount = published.rows[0]?.count ?? 0;
-    const unexpected = await query<{ count: number }>(
+    const unexpected = await client.query<{ count: number }>(
       `
         select count(*)::int as count
         from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
@@ -2083,14 +2587,16 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
           ${shouldFilterType ? "and ia.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
           and not exists (
             select 1
-            from public.${quoteIdentifier(rule.view_name)} p
+            from public.${quoteIdentifier(finalViewName)} p
             where p.codigo_crm = ia.codigo_crm
+              ${shouldFilterType ? `and p.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
           )
       `,
       shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
     );
     const unexpectedCount = unexpected.rows[0]?.count ?? 0;
     return updateRuleHealthcheckStatus(
+      client,
       rule,
       expectedCount,
       publishedCount,
@@ -2101,6 +2607,7 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
     );
   } catch (error) {
     return updateRuleHealthcheckStatus(
+      client,
       rule,
       null,
       null,
@@ -2113,6 +2620,7 @@ async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleH
 }
 
 async function updateRuleHealthcheckStatus(
+  client: PoolClient,
   rule: HealthcheckRuleRow,
   expectedCount: number | null,
   publishedCount: number | null,
@@ -2121,7 +2629,7 @@ async function updateRuleHealthcheckStatus(
   checkedAt: string,
   error: string | null
 ): Promise<RuleHealthcheckStatus> {
-  await query(
+  await client.query(
     `
       update publish_rules
       set health_expected_count = $2,
@@ -2160,7 +2668,7 @@ async function refreshRuleView(
 ) {
   const targetViewName = viewName ?? `pc_rule_${id}`;
   const columns = await getBaseColumns(client);
-  const limitSql = rule.use_ad_limit ? buildAdLimitSql(rule.portal_id, rule.ad_limit_type) : null;
+  const sourceColumns = await listPublishSelectableColumns(client, rule.source_table);
   const sql = buildViewSql(
     targetViewName,
     rule.source_table,
@@ -2169,7 +2677,9 @@ async function refreshRuleView(
     rule.include_locked,
     rule.active,
     rule.publication_priority,
-    limitSql
+    null,
+    sourceColumns,
+    true
   );
   await client.query(sql);
 

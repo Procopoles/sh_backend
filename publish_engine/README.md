@@ -13,6 +13,8 @@ npm run dev
 
 Em desenvolvimento local, a aplicacao usa `DATABASE_URL` em `.env.local` para conectar direto no Postgres `base_dados`.
 
+Use o dev server padrao do Next (`npm.cmd run dev` no Windows). Nao inicie com `--turbo`, pois o Turbopack quebra o carregamento de CSS e dos icones Material Symbols neste projeto.
+
 ## Modelo
 
 - `publish_portals`: cadastro de portais.

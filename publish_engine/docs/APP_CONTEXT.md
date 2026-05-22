@@ -132,7 +132,7 @@ Tabelas base existentes:
 Tabelas criadas pela aplicacao:
 
 - `publish_portals`: cadastro de portais.
-- `publish_portal_ad_types`: tipos/niveis de anuncio por portal, com `name` e `quantity`.
+- `publish_portal_ad_types`: tipos/niveis de anuncio por portal, com `name`, `slug` e `quantity`. O `slug` e o identificador usado nas consultas em `publicacao_portais`.
 - `publish_rules`: regras, filtros JSON, `view_name`, `last_sql`, `last_count`.
 
 O total de anuncios/cotas de um portal e calculado por `sum(quantity)` em `publish_portal_ad_types`.

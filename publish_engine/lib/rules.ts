@@ -41,6 +41,8 @@ export type RuleRowsPreviewColumn = {
   label: string;
 };
 
+export const RULE_INDEX_COLUMN = "__publish_rule_index";
+
 export function slugify(value: string) {
   return value
     .normalize("NFD")
@@ -308,14 +310,27 @@ export function buildViewSql(
   includeLocked: boolean,
   active: boolean,
   publicationPriority: PublicationPriority = DEFAULT_PUBLICATION_PRIORITY,
-  limitSql?: string | null
+  limitSql?: string | null,
+  selectColumns?: string[],
+  includeRuleIndex = false
 ) {
   const whereSql = active
     ? buildWhereSql(filters, columns, includeLocked, false).whereSql
     : "false";
 
   return `create or replace view public.${quoteIdentifier(viewName)} as
-${buildRuleSelectSql(sourceTable, filters, columns, includeLocked, active, whereSql, publicationPriority, limitSql)}`;
+${buildRuleSelectSql(
+  sourceTable,
+  filters,
+  columns,
+  includeLocked,
+  active,
+  whereSql,
+  publicationPriority,
+  limitSql,
+  selectColumns,
+  includeRuleIndex
+)}`;
 }
 
 export function buildRuleSelectSql(
@@ -326,15 +341,23 @@ export function buildRuleSelectSql(
   active: boolean,
   resolvedWhereSql?: string,
   publicationPriority: PublicationPriority = DEFAULT_PUBLICATION_PRIORITY,
-  limitSql?: string | null
+  limitSql?: string | null,
+  selectColumns?: string[],
+  includeRuleIndex = false
 ) {
   const whereSql =
     resolvedWhereSql ??
     (active ? buildWhereSql(filters, columns, includeLocked, false).whereSql : "false");
   const orderBySql = buildOrderBySql(publicationPriority, columns);
   const resolvedLimitSql = limitSql ? `\nlimit ${limitSql}` : "";
+  const selectSql = selectColumns?.length
+    ? selectColumns.map((column) => `b.${quoteIdentifier(column)}`).join(", ")
+    : "b.*";
+  const ruleIndexSql = includeRuleIndex
+    ? `, row_number() over (${buildWindowOrderBySql(publicationPriority, columns, selectColumns)})::integer as ${quoteIdentifier(RULE_INDEX_COLUMN)}`
+    : "";
 
-  return `select b.*
+  return `select ${selectSql}${ruleIndexSql}
 from public.${quoteIdentifier(sourceTable)} b
 where ${whereSql}${orderBySql}${resolvedLimitSql}`;
 }
@@ -381,9 +404,9 @@ limit ${previewLimit}`,
   };
 }
 
-function buildOrderBySql(priority: PublicationPriority, columns: ColumnMetadata[]) {
+function buildOrderByParts(priority: PublicationPriority, columns: ColumnMetadata[]) {
   const lookup = createColumnLookup(columns);
-  const parts = sanitizePublicationPriority(priority, columns)
+  return sanitizePublicationPriority(priority, columns)
     .map((item) => {
       if ("conditions" in item) {
         const groupSql = buildFilterGroupSql(item, lookup, [], false, false);
@@ -398,8 +421,24 @@ function buildOrderBySql(priority: PublicationPriority, columns: ColumnMetadata[
       return `${target.columnSql} ${direction} ${nulls}`;
     })
     .filter((part): part is string => Boolean(part));
+}
+
+function buildOrderBySql(priority: PublicationPriority, columns: ColumnMetadata[]) {
+  const parts = buildOrderByParts(priority, columns);
 
   return parts.length ? `\norder by ${parts.join(", ")}` : "";
+}
+
+function buildWindowOrderBySql(priority: PublicationPriority, columns: ColumnMetadata[], selectColumns?: string[]) {
+  const parts = buildOrderByParts(priority, columns);
+  const tieBreaker = selectColumns?.includes("codigo_crm")
+    ? "b.codigo_crm asc nulls last"
+    : selectColumns?.includes("id_interno")
+      ? "b.id_interno asc nulls last"
+      : null;
+
+  if (tieBreaker && !parts.includes(tieBreaker)) parts.push(tieBreaker);
+  return parts.length ? `order by ${parts.join(", ")}` : "";
 }
 
 function previewColumnsForFilters(filters: RuleFilters, columns: ColumnMetadata[]) {
