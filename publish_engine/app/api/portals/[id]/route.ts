@@ -14,6 +14,13 @@ export async function PUT(request: Request, context: Context) {
       return NextResponse.json({ error: "Nome é obrigatório." }, { status: 400 });
     }
 
+    if (!body.slug?.trim()) {
+      return NextResponse.json({ error: "Slug e obrigatorio." }, { status: 400 });
+    }
+    if (!/^[a-z0-9_]+$/.test(body.slug.trim())) {
+      return NextResponse.json({ error: "Slug deve usar apenas letras minusculas, numeros e underscore." }, { status: 400 });
+    }
+
     const portal = await updatePortal(Number(id), body);
     if (!portal) return NextResponse.json({ error: "Portal não encontrado." }, { status: 404 });
     return NextResponse.json({ portal });

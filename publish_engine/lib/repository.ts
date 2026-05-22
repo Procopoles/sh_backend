@@ -3,6 +3,7 @@ import { dataApiRequest, dataApiRpc, isDataApiConfigured } from "./data-api";
 import { ensureControlSchema, getPool, query, withTransaction } from "./db";
 import {
   buildAdLimitSql,
+  buildRuleSelectSql,
   buildViewSql,
   buildWhereSql,
   buildRuleRowsPreviewQuery,
@@ -10,14 +11,32 @@ import {
   DEFAULT_PUBLICATION_PRIORITY,
   getBaseColumns,
   quoteIdentifier,
+  quoteLiteral,
+  resolveRuleColumnTarget,
   sanitizeFilters,
   sanitizePublicationPriority,
   slugify
 } from "./rules";
-import type { ColumnMetadata, Portal, PortalAdType, PublicationPriority, PublicationRule, RuleFilters, SourceViewMetadata } from "./types";
+import type {
+  ColumnMetadata,
+  Portal,
+  PortalAdType,
+  PublicationPriority,
+  PublicationRule,
+  RuleHealthcheckReport,
+  RuleHealthcheckReportRule,
+  RuleHealthcheckStatus,
+  RuleFilters,
+  RuleSummaryCalculation,
+  RuleSummaryConfigItem,
+  RuleSummaryItemResult,
+  RuleSummaryResponse,
+  SourceViewMetadata
+} from "./types";
 
 type PortalInput = {
   name: string;
+  slug?: string | null;
   description?: string | null;
   logo_url?: string | null;
   active?: boolean;
@@ -41,11 +60,38 @@ type RuleInput = {
   ad_limit_type?: string | null;
   filters?: RuleFilters;
   publication_priority?: PublicationPriority;
+  summary_config?: RuleSummaryConfigItem[] | null;
 };
 
 type PreviewRowsInput = RuleInput & {
   limit?: number;
+  preview_sort_column?: string | null;
+  preview_sort_direction?: "asc" | "desc" | null;
 };
+
+type RuleSummaryInput = RuleInput & {
+  items?: RuleSummaryConfigItem[];
+};
+
+const DEFAULT_SUMMARY_GROUP_COUNT = 5;
+const DEFAULT_SUMMARY_VALUE_COUNT_LIMIT = 5;
+const MAX_SUMMARY_ITEMS = 12;
+const DATA_API_COLUMNS_CACHE_MS = 5 * 60 * 1000;
+const HEALTHCHECK_REPORT_CACHE_MS = Math.max(
+  10_000,
+  Number(process.env.HEALTHCHECK_REPORT_CACHE_MS ?? "120000") || 120_000
+);
+
+let dataApiColumnsCache: { expiresAt: number; columns: ColumnMetadata[] } | null = null;
+let dataApiHealthcheckReportCache: { key: string; expiresAt: number; value: RuleHealthcheckReport } | null = null;
+
+const healthcheckReportRuleCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    value: RuleHealthcheckReportRule;
+  }
+>();
 
 export async function listPortals() {
   if (isDataApiConfigured()) return listPortalsViaApi();
@@ -81,7 +127,7 @@ export async function createPortal(input: PortalInput) {
 
   await ensureControlSchema();
   return withTransaction(async (client) => {
-    const slug = slugify(input.name);
+    const slug = normalizePortalSlug(input.slug, input.name);
     const result = await client.query<Portal>(
       `
         insert into publish_portals (name, slug, description, logo_url, active)
@@ -100,7 +146,7 @@ export async function updatePortal(id: number, input: PortalInput) {
 
   await ensureControlSchema();
   return withTransaction(async (client) => {
-    const slug = slugify(input.name);
+    const slug = normalizePortalSlug(input.slug, input.name);
     const result = await client.query<Portal>(
       `
         update publish_portals
@@ -133,7 +179,7 @@ export async function listRules(portalId?: number) {
   const params = portalId ? [portalId] : [];
   const result = await query<PublicationRule>(
     `
-      select r.*, p.name as portal_name
+      select r.*, p.name as portal_name, p.slug as portal_slug
       from publish_rules r
       left join publish_portals p on p.id = r.portal_id
       ${portalId ? "where r.portal_id = $1" : ""}
@@ -159,13 +205,14 @@ export async function createRule(input: RuleInput) {
     const slug = slugify(input.name);
     const filters = sanitizeFilters(input.filters ?? DEFAULT_FILTERS, columns);
     const publicationPriority = sanitizePublicationPriority(input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+    const summaryConfig = sanitizeRuleSummaryConfig(input.summary_config, columns);
     const sourceTable = await validateSourceTable(client, input.source_table);
     const adLimit = await normalizeRuleAdLimit(client, portalId, input.use_ad_limit ?? false, input.ad_limit_type);
     const inserted = await client.query<PublicationRule>(
       `
         insert into publish_rules
-          (portal_id, name, slug, description, source_table, active, include_locked, use_ad_limit, ad_limit_type, filters, publication_priority)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
+          (portal_id, name, slug, description, source_table, active, include_locked, use_ad_limit, ad_limit_type, filters, publication_priority, summary_config)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb)
         returning *
       `,
       [
@@ -179,7 +226,8 @@ export async function createRule(input: RuleInput) {
         adLimit.useAdLimit,
         adLimit.adLimitType,
         JSON.stringify(filters),
-        JSON.stringify(publicationPriority)
+        JSON.stringify(publicationPriority),
+        summaryConfig == null ? null : JSON.stringify(summaryConfig)
       ]
     );
 
@@ -194,7 +242,8 @@ export async function createRule(input: RuleInput) {
       include_locked: input.include_locked ?? true,
       use_ad_limit: adLimit.useAdLimit,
       ad_limit_type: adLimit.adLimitType,
-      publication_priority: publicationPriority
+      publication_priority: publicationPriority,
+      summary_config: summaryConfig
     });
   });
 }
@@ -218,6 +267,10 @@ export async function updateRule(id: number, input: RuleInput) {
       input.publication_priority ?? existing.rows[0].publication_priority ?? DEFAULT_PUBLICATION_PRIORITY,
       columns
     );
+    const summaryConfig =
+      input.summary_config === undefined
+        ? existing.rows[0].summary_config ?? null
+        : sanitizeRuleSummaryConfig(input.summary_config, columns);
     const sourceTable = await validateSourceTable(client, input.source_table ?? existing.rows[0].source_table, id);
     const adLimit = await normalizeRuleAdLimit(
       client,
@@ -240,6 +293,7 @@ export async function updateRule(id: number, input: RuleInput) {
             ad_limit_type = $10,
             filters = $11::jsonb,
             publication_priority = $12::jsonb,
+            summary_config = $13::jsonb,
             updated_at = now()
         where id = $1
         returning *
@@ -256,7 +310,8 @@ export async function updateRule(id: number, input: RuleInput) {
         adLimit.useAdLimit,
         adLimit.adLimitType,
         JSON.stringify(filters),
-        JSON.stringify(publicationPriority)
+        JSON.stringify(publicationPriority),
+        summaryConfig == null ? null : JSON.stringify(summaryConfig)
       ]
     );
 
@@ -268,8 +323,30 @@ export async function updateRule(id: number, input: RuleInput) {
       include_locked: input.include_locked ?? true,
       use_ad_limit: adLimit.useAdLimit,
       ad_limit_type: adLimit.adLimitType,
-      publication_priority: publicationPriority
+      publication_priority: publicationPriority,
+      summary_config: summaryConfig
     });
+  });
+}
+
+export async function updateRuleSummaryConfig(id: number, summaryConfigInput: unknown) {
+  if (isDataApiConfigured()) return updateRuleSummaryConfigViaApi(id, summaryConfigInput);
+
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const columns = await getBaseColumns(client);
+    const summaryConfig = sanitizeRuleSummaryConfig(summaryConfigInput, columns);
+    const result = await client.query<PublicationRule>(
+      `
+        update publish_rules
+        set summary_config = $2::jsonb,
+            updated_at = now()
+        where id = $1
+        returning *
+      `,
+      [id, summaryConfig == null ? null : JSON.stringify(summaryConfig)]
+    );
+    return result.rows[0] ?? null;
   });
 }
 
@@ -287,6 +364,98 @@ export async function deleteRule(id: number) {
     }
     await client.query("delete from publish_rules where id = $1", [id]);
   });
+}
+
+export async function runRuleHealthchecks(ruleId?: number | null): Promise<RuleHealthcheckStatus[]> {
+  if (isDataApiConfigured()) return runRuleHealthchecksViaApi(ruleId);
+
+  await ensureControlSchema();
+  const result = await query<
+    Pick<
+      PublicationRule,
+      "id" | "portal_id" | "view_name" | "use_ad_limit" | "ad_limit_type"
+    > & { portal_slug: string | null }
+  >(
+    `
+      select r.id, r.portal_id, r.view_name, r.use_ad_limit, r.ad_limit_type, p.slug as portal_slug
+      from publish_rules r
+      left join publish_portals p on p.id = r.portal_id
+      ${ruleId ? "where r.id = $1" : ""}
+      order by r.updated_at desc, r.id desc
+    `,
+    ruleId ? [ruleId] : []
+  );
+
+  const statuses: RuleHealthcheckStatus[] = [];
+  for (const rule of result.rows) {
+    statuses.push(await runSingleRuleHealthcheck(rule));
+  }
+  return statuses;
+}
+
+export async function getRuleHealthcheckReport(options: { ruleId?: number | null; refresh?: boolean } = {}): Promise<RuleHealthcheckReport> {
+  const ruleId = normalizeOptionalPositiveInteger(options.ruleId);
+  if (isDataApiConfigured()) return getRuleHealthcheckReportViaApi(ruleId, Boolean(options.refresh));
+
+  await ensureControlSchema();
+  const result = await query<HealthcheckReportRuleRow>(
+    `
+      select r.id,
+             r.name,
+             r.slug,
+             r.view_name,
+             r.active,
+             r.use_ad_limit,
+             r.ad_limit_type,
+             r.health_expected_count,
+             r.health_published_count,
+             r.health_pending_count,
+             r.health_unexpected_count,
+             r.health_checked_at,
+             r.health_error,
+             r.updated_at,
+             p.id as portal_id,
+             p.name as portal_name,
+             p.slug as portal_slug
+      from publish_rules r
+      join publish_portals p on p.id = r.portal_id
+      where r.active = true
+        ${ruleId ? "and r.id = $1" : ""}
+      order by p.name asc, r.name asc, r.id asc
+    `,
+    ruleId ? [ruleId] : []
+  );
+
+  let ruleHits = 0;
+  let ruleMisses = 0;
+  const rules = await mapWithConcurrency(result.rows, 4, async (rule) => {
+    const cacheKey = healthcheckReportRuleCacheKey(rule);
+    const cached = options.refresh ? null : healthcheckReportRuleCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      ruleHits += 1;
+      return cached.value;
+    }
+
+    ruleMisses += 1;
+    const value = await buildHealthcheckReportRule(rule);
+    healthcheckReportRuleCache.set(cacheKey, {
+      expiresAt: Date.now() + HEALTHCHECK_REPORT_CACHE_MS,
+      value
+    });
+    trimHealthcheckReportRuleCache();
+    return value;
+  });
+
+  return {
+    generated_at: new Date().toISOString(),
+    cached: ruleMisses === 0,
+    cache: {
+      ttl_ms: HEALTHCHECK_REPORT_CACHE_MS,
+      rule_hits: ruleHits,
+      rule_misses: ruleMisses
+    },
+    rules
+  };
 }
 
 export async function previewRule(input: RuleInput) {
@@ -328,18 +497,472 @@ export async function previewRuleRows(input: PreviewRowsInput) {
       columns,
       input.include_locked ?? true,
       input.active ?? true,
-      adLimitQuota == null ? input.limit ?? 10 : Math.min(input.limit ?? 10, adLimitQuota),
-      publicationPriority
+      input.limit ?? 10,
+      publicationPriority,
+      adLimitQuota,
+      input.preview_sort_column ?? null,
+      input.preview_sort_direction === "desc" ? "desc" : "asc"
     );
     const result = await client.query<Record<string, unknown>>(preview.sql, preview.params);
     return { columns: preview.columns, rows: result.rows };
   });
 }
 
+export async function previewRuleSummary(input: RuleSummaryInput): Promise<RuleSummaryResponse> {
+  if (isDataApiConfigured()) return previewRuleSummaryViaApi(input);
+
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const columns = await getBaseColumns(client);
+    const filters = sanitizeFilters(input.filters ?? DEFAULT_FILTERS, columns);
+    const publicationPriority = sanitizePublicationPriority(input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+    const sourceTable = await validateSourceTable(client, input.source_table);
+    const portalId = normalizePortalId(input.portal_id);
+    const limitSql = input.use_ad_limit ? buildAdLimitSql(portalId, input.ad_limit_type) : null;
+    const selectionSql = buildRuleSelectSqlForSummary(
+      sourceTable,
+      filters,
+      columns,
+      input.include_locked ?? true,
+      input.active ?? true,
+      publicationPriority,
+      limitSql
+    );
+    const items = normalizeSummaryItems(input.items, columns);
+    if (!items.length) {
+      const totalResult = await client.query<{ total: number }>(
+        `select count(*)::int as total from (${selectionSql}) summary_selection`
+      );
+      return { total: totalResult.rows[0]?.total ?? 0, items: [] };
+    }
+
+    const summarySelectionSql = await materializeRuleSummarySelection(client, selectionSql);
+    const totalResult = await client.query<{ total: number }>(
+      `select count(*)::int as total from (${summarySelectionSql}) summary_selection`
+    );
+    const total = totalResult.rows[0]?.total ?? 0;
+    const resultItems: RuleSummaryItemResult[] = [];
+
+    for (const item of items) {
+      resultItems.push(await summarizeRuleItem(client, summarySelectionSql, item, total));
+    }
+
+    return { total, items: resultItems };
+  });
+}
+
+function buildRuleSelectSqlForSummary(
+  sourceTable: string,
+  filters: RuleFilters,
+  columns: ColumnMetadata[],
+  includeLocked: boolean,
+  active: boolean,
+  publicationPriority: PublicationPriority,
+  limitSql?: string | null
+) {
+  return buildRuleSelectSql(
+    sourceTable,
+    filters,
+    columns,
+    includeLocked,
+    active,
+    undefined,
+    limitSql ? publicationPriority : DEFAULT_PUBLICATION_PRIORITY,
+    limitSql
+  );
+}
+
+async function materializeRuleSummarySelection(client: PoolClient, selectionSql: string) {
+  await client.query("drop table if exists pg_temp.rule_summary_selection");
+  await client.query(`create temporary table rule_summary_selection on commit drop as ${selectionSql}`);
+  return "select * from rule_summary_selection";
+}
+
+type NormalizedRuleSummaryItem = {
+  column: string;
+  jsonPath: string[] | null;
+  jsonValueKind: ColumnMetadata["filter_kind"] | null;
+  calculation: RuleSummaryCalculation;
+  groupCount: number;
+  label: string;
+  dataType: string;
+  filterKind: ColumnMetadata["filter_kind"];
+  target: NonNullable<ReturnType<typeof resolveRuleColumnTarget>>;
+};
+
+function normalizeSummaryItems(items: unknown, columns: ColumnMetadata[]): NormalizedRuleSummaryItem[] {
+  if (!Array.isArray(items)) return [];
+
+  const normalized: NormalizedRuleSummaryItem[] = [];
+  const seen = new Set<string>();
+
+  for (const item of items) {
+    if (!isSummaryRecord(item) || typeof item.column !== "string") continue;
+
+    const target = resolveRuleColumnTarget(columns, item.column, item.jsonPath, item.jsonValueKind, "s");
+    if (!target) continue;
+
+    const jsonPath = Array.isArray(target.metadata.json_path) && target.metadata.json_path.length ? target.metadata.json_path : null;
+    const calculation = normalizeSummaryCalculation(item.calculation, target.metadata.filter_kind);
+    const key = JSON.stringify([target.metadata.column_name, jsonPath, calculation]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    normalized.push({
+      column: target.metadata.column_name,
+      jsonPath,
+      jsonValueKind: jsonPath ? target.metadata.filter_kind : null,
+      calculation,
+      groupCount: normalizeSummaryGroupCount(item.groupCount),
+      label: summaryColumnLabel(target.metadata),
+      dataType: target.metadata.data_type || target.metadata.udt_name || target.metadata.filter_kind,
+      filterKind: target.metadata.filter_kind,
+      target
+    });
+
+    if (normalized.length >= MAX_SUMMARY_ITEMS) break;
+  }
+
+  return normalized;
+}
+
+function sanitizeRuleSummaryConfig(items: unknown, columns: ColumnMetadata[]): RuleSummaryConfigItem[] | null {
+  if (items == null) return null;
+
+  return normalizeSummaryItems(items, columns).map((item) => ({
+    column: item.column,
+    jsonPath: item.jsonPath,
+    jsonValueKind: item.jsonValueKind,
+    calculation: item.calculation,
+    groupCount: item.groupCount
+  }));
+}
+
+function normalizeSummaryCalculation(
+  value: unknown,
+  filterKind: ColumnMetadata["filter_kind"]
+): RuleSummaryCalculation {
+  const calculation: RuleSummaryCalculation =
+    value === "range" || value === "group" || value === "count" ? value : "count";
+
+  if (calculation === "range" && !["number", "datetime", "text"].includes(filterKind)) return "count";
+  return calculation;
+}
+
+function normalizeSummaryGroupCount(value: unknown) {
+  const count = typeof value === "number" ? value : DEFAULT_SUMMARY_GROUP_COUNT;
+  if (!Number.isFinite(count)) return DEFAULT_SUMMARY_GROUP_COUNT;
+  return Math.max(2, Math.min(10, Math.trunc(count)));
+}
+
+async function summarizeRuleItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem,
+  total: number
+): Promise<RuleSummaryItemResult> {
+  if (item.calculation === "range") return summarizeRangeItem(client, selectionSql, item);
+  if (item.calculation === "group") return summarizeGroupItem(client, selectionSql, item, total);
+  return summarizeCountItem(client, selectionSql, item);
+}
+
+async function summarizeRangeItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem
+): Promise<RuleSummaryItemResult> {
+  const result = await client.query<{
+    total_count: number;
+    filled_count: number;
+    min: string | null;
+    max: string | null;
+  }>(`
+    with final_selection as (${selectionSql})
+    select
+      count(*)::int as total_count,
+      count(${item.target.columnSql})::int as filled_count,
+      min(${item.target.columnSql})::text as min,
+      max(${item.target.columnSql})::text as max
+    from final_selection s
+  `);
+  const row = result.rows[0];
+
+  return {
+    column: item.column,
+    jsonPath: item.jsonPath,
+    label: item.label,
+    calculation: "range",
+    data_type: item.dataType,
+    filter_kind: item.filterKind,
+    filled_count: row?.filled_count ?? 0,
+    total_count: row?.total_count ?? 0,
+    min: row?.min ?? null,
+    max: row?.max ?? null
+  };
+}
+
+async function summarizeCountItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem
+): Promise<RuleSummaryItemResult> {
+  const filledSql = summaryFilledSql(item);
+  const labelSql = summaryCountLabelSql(item);
+  const result = await client.query<{
+    total_count: number;
+    filled_count: number;
+    empty_count: number;
+    distinct_count: number;
+    value_counts: Array<{ label: string; count: number }>;
+  }>(`
+    with final_selection as (${selectionSql}),
+    summary_labels as (
+      select ${filledSql} as filled_value, ${labelSql} as label
+      from final_selection s
+    ),
+    stats as (
+      select
+        count(*)::int as total_count,
+        count(filled_value)::int as filled_count,
+        (count(*) - count(filled_value))::int as empty_count,
+        count(distinct label)::int as distinct_count
+      from summary_labels
+    ),
+    top_values as (
+      select label, count(*)::int as count
+      from summary_labels
+      group by label
+      order by count desc, label asc
+      limit ${DEFAULT_SUMMARY_VALUE_COUNT_LIMIT}
+    )
+    select
+      stats.total_count,
+      stats.filled_count,
+      stats.empty_count,
+      stats.distinct_count,
+      coalesce(
+        json_agg(
+          json_build_object('label', top_values.label, 'count', top_values.count)
+          order by top_values.count desc, top_values.label asc
+        ) filter (where top_values.label is not null),
+        '[]'::json
+      ) as value_counts
+    from stats
+    left join top_values on true
+    group by stats.total_count, stats.filled_count, stats.empty_count, stats.distinct_count
+  `);
+  const row = result.rows[0];
+
+  return {
+    column: item.column,
+    jsonPath: item.jsonPath,
+    label: item.label,
+    calculation: "count",
+    data_type: item.dataType,
+    filter_kind: item.filterKind,
+    filled_count: row?.filled_count ?? 0,
+    empty_count: row?.empty_count ?? 0,
+    distinct_count: row?.distinct_count ?? 0,
+    total_count: row?.total_count ?? 0,
+    value_count_limit: DEFAULT_SUMMARY_VALUE_COUNT_LIMIT,
+    values: row?.value_counts ?? []
+  };
+}
+
+async function summarizeGroupItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem,
+  total: number
+): Promise<RuleSummaryItemResult> {
+  if (item.filterKind === "number") return summarizeNumericGroupItem(client, selectionSql, item, total);
+  return summarizeExactGroupItem(client, selectionSql, item, total);
+}
+
+async function summarizeNumericGroupItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem,
+  total: number
+): Promise<RuleSummaryItemResult> {
+  const result = await client.query<{
+    bucket: number;
+    min_value: string | null;
+    max_value: string | null;
+    count: number;
+  }>(`
+    with final_selection as (${selectionSql}),
+    summary_values as (
+      select ${item.target.columnSql}::numeric as value
+      from final_selection s
+      where ${item.target.columnSql} is not null
+    ),
+    bounds as (
+      select
+        case
+          when min(value) = 0 and min(value) filter (where value <> 0) is not null then min(value) filter (where value <> 0)
+          else min(value)
+        end as min_value,
+        max(value) as max_value,
+        min(value) = 0 and min(value) filter (where value <> 0) is not null as ignore_zero_floor
+      from summary_values
+    ),
+    bucket_settings as (
+      select
+        bounds.*,
+        chosen_step.step,
+        floor(bounds.min_value / chosen_step.floor_unit) * chosen_step.floor_unit as floor_value
+      from bounds
+      left join lateral (
+        with raw as (
+          select (bounds.max_value - bounds.min_value) / ${item.groupCount} as raw_step
+        ),
+        step_candidates as (
+          select
+            factor * power(10::double precision, exponent)::numeric as step,
+            power(10::double precision, exponent)::numeric as floor_unit,
+            raw.raw_step
+          from raw
+          cross join lateral generate_series(
+            floor(log(greatest(raw.raw_step::double precision, 1e-12)))::int - 1,
+            floor(log(greatest(raw.raw_step::double precision, 1e-12)))::int + 12
+          ) as exponents(exponent)
+          cross join (values (1::numeric), (2::numeric), (5::numeric), (10::numeric)) factors(factor)
+          where raw.raw_step > 0
+        )
+        select step, floor_unit
+        from step_candidates
+        where step >= raw_step
+          and ceil((bounds.max_value - floor(bounds.min_value / floor_unit) * floor_unit) / step) <= ${item.groupCount}
+        order by step
+        limit 1
+      ) chosen_step on bounds.min_value is not null and bounds.min_value <> bounds.max_value
+    ),
+    bucketed_raw as (
+      select
+        case
+          when bucket_settings.min_value is null then null
+          when bucket_settings.min_value = bucket_settings.max_value then 1
+          else least(
+            greatest(floor((summary_values.value - bucket_settings.floor_value) / bucket_settings.step)::int + 1, 1),
+            ${item.groupCount}
+          )
+        end as bucket,
+        summary_values.value,
+        bucket_settings.min_value,
+        bucket_settings.max_value,
+        bucket_settings.floor_value,
+        bucket_settings.step
+      from summary_values
+      cross join bucket_settings
+      where bucket_settings.min_value is not null
+        and (not bucket_settings.ignore_zero_floor or summary_values.value <> 0)
+    ),
+    bucketed as (
+      select
+        bucket,
+        value,
+        case
+          when min_value = max_value then value
+          else floor_value + ((bucket - 1) * step)
+        end as bucket_min,
+        case
+          when min_value = max_value then value
+          else floor_value + (bucket * step)
+        end as bucket_max
+      from bucketed_raw
+    )
+    select bucket::int, min(bucket_min)::text as min_value, max(bucket_max)::text as max_value, count(*)::int as count
+    from bucketed
+    where bucket is not null
+    group by bucket
+    order by bucket
+  `);
+
+  return {
+    column: item.column,
+    jsonPath: item.jsonPath,
+    label: item.label,
+    calculation: "group",
+    data_type: item.dataType,
+    filter_kind: item.filterKind,
+    group_count: item.groupCount,
+    total_count: total,
+    groups: result.rows.map((row) => ({
+      label: summaryRangeLabel(row.min_value, row.max_value),
+      count: row.count,
+      min: row.min_value,
+      max: row.max_value
+    }))
+  };
+}
+
+async function summarizeExactGroupItem(
+  client: PoolClient,
+  selectionSql: string,
+  item: NormalizedRuleSummaryItem,
+  total: number
+): Promise<RuleSummaryItemResult> {
+  const labelSql = `coalesce(nullif(btrim(${item.target.textColumnSql}::text), ''), 'Sem valor')`;
+  const result = await client.query<{ label: string; count: number }>(`
+    with final_selection as (${selectionSql})
+    select ${labelSql} as label, count(*)::int as count
+    from final_selection s
+    group by label
+    order by count desc, label asc
+    limit ${item.groupCount}
+  `);
+
+  return {
+    column: item.column,
+    jsonPath: item.jsonPath,
+    label: item.label,
+    calculation: "group",
+    data_type: item.dataType,
+    filter_kind: item.filterKind,
+    group_count: item.groupCount,
+    total_count: total,
+    groups: result.rows.map((row) => ({ label: row.label, count: row.count }))
+  };
+}
+
+function summaryFilledSql(item: NormalizedRuleSummaryItem) {
+  if (item.filterKind === "text" || item.filterKind === "json") {
+    return `nullif(btrim(${item.target.textColumnSql}::text), '')`;
+  }
+  return item.target.nullCheckSql;
+}
+
+function summaryCountLabelSql(item: NormalizedRuleSummaryItem) {
+  if (item.filterKind === "text" || item.filterKind === "json") {
+    return `coalesce(nullif(btrim(${item.target.textColumnSql}::text), ''), 'Sem valor')`;
+  }
+  if (item.filterKind === "boolean") {
+    return `case when ${item.target.columnSql} is true then 'Verdadeiro' when ${item.target.columnSql} is false then 'Falso' else 'Sem valor' end`;
+  }
+  return `coalesce(${item.target.columnSql}::text, 'Sem valor')`;
+}
+
+function summaryColumnLabel(column: ColumnMetadata) {
+  if (column.display_name) return column.display_name;
+  const path = Array.isArray(column.json_path) ? column.json_path.filter(Boolean) : [];
+  return path.length ? `${column.column_name}.${path.join(".")}` : column.column_name;
+}
+
+function summaryRangeLabel(min: string | null, max: string | null) {
+  if (!min && !max) return "Sem valor";
+  if (min === max) return min ?? max ?? "Sem valor";
+  return `${min ?? "-"} ate ${max ?? "-"}`;
+}
+
+function isSummaryRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 export async function getMetadata() {
   if (isDataApiConfigured()) {
     const [columns, counts, sourceViews] = await Promise.all([
-      dataApiRpc<ColumnMetadata[]>("publish_base_columns"),
+      listBaseColumnsViaApi(),
       dataApiRpc<Array<{ base_imoveis: number; publish_locks: number }>>("publish_control_counts"),
       listSourceViewsViaApi()
     ]);
@@ -396,12 +1019,13 @@ async function listPortalsViaApi() {
 }
 
 async function createPortalViaApi(input: PortalInput) {
+  const slug = normalizePortalSlug(input.slug, input.name);
   const rows = await dataApiRequest<Portal[]>("/publish_portals", {
     method: "POST",
     prefer: "return=representation",
     body: {
       name: input.name.trim(),
-      slug: slugify(input.name),
+      slug,
       description: input.description ?? null,
       logo_url: input.logo_url ?? null,
       active: input.active ?? true
@@ -412,12 +1036,13 @@ async function createPortalViaApi(input: PortalInput) {
 }
 
 async function updatePortalViaApi(id: number, input: PortalInput) {
+  const slug = normalizePortalSlug(input.slug, input.name);
   const rows = await dataApiRequest<Portal[]>(`/publish_portals?id=eq.${id}`, {
     method: "PATCH",
     prefer: "return=representation",
     body: {
       name: input.name.trim(),
-      slug: slugify(input.name),
+      slug,
       description: input.description ?? null,
       logo_url: input.logo_url ?? null,
       active: input.active ?? true,
@@ -440,16 +1065,22 @@ async function listRulesViaApi(portalId?: number) {
     : "/publish_rules?order=updated_at.desc,id.desc";
   const [rules, portals] = await Promise.all([
     dataApiRequest<PublicationRule[]>(rulePath),
-    dataApiRequest<Array<Pick<Portal, "id" | "name">>>("/publish_portals?select=id,name")
+    dataApiRequest<Array<Pick<Portal, "id" | "name" | "slug">>>("/publish_portals?select=id,name,slug")
   ]);
   const portalNames = new Map(portals.map((portal) => [portal.id, portal.name]));
-  return rules.map((rule) => ({ ...rule, portal_name: rule.portal_id == null ? undefined : portalNames.get(rule.portal_id) }));
+  const portalSlugs = new Map(portals.map((portal) => [portal.id, portal.slug]));
+  return rules.map((rule) => ({
+    ...rule,
+    portal_name: rule.portal_id == null ? undefined : portalNames.get(rule.portal_id),
+    portal_slug: rule.portal_id == null ? undefined : portalSlugs.get(rule.portal_id)
+  }));
 }
 
 async function createRuleViaApi(input: RuleInput) {
   const columns = await listBaseColumnsViaApi();
   const filters = sanitizeFilters(input.filters ?? DEFAULT_FILTERS, columns);
   const publicationPriority = sanitizePublicationPriority(input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+  const summaryConfig = sanitizeRuleSummaryConfig(input.summary_config, columns);
   const sourceTable = await validateSourceTableViaApi(input.source_table);
   const portalId = normalizePortalId(input.portal_id);
   if (portalId) await assertPortalExistsViaApi(portalId);
@@ -468,7 +1099,8 @@ async function createRuleViaApi(input: RuleInput) {
       use_ad_limit: adLimit.useAdLimit,
       ad_limit_type: adLimit.adLimitType,
       filters,
-      publication_priority: publicationPriority
+      publication_priority: publicationPriority,
+      summary_config: summaryConfig
     }
   });
 
@@ -488,6 +1120,10 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
     input.publication_priority ?? existing[0].publication_priority ?? DEFAULT_PUBLICATION_PRIORITY,
     columns
   );
+  const summaryConfig =
+    input.summary_config === undefined
+      ? existing[0].summary_config ?? null
+      : sanitizeRuleSummaryConfig(input.summary_config, columns);
   const sourceTable = await validateSourceTableViaApi(input.source_table ?? existing[0].source_table, id);
   const portalId = input.portal_id === undefined ? existing[0].portal_id : normalizePortalId(input.portal_id);
   if (portalId) await assertPortalExistsViaApi(portalId);
@@ -511,6 +1147,7 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
       ad_limit_type: adLimit.adLimitType,
       filters,
       publication_priority: publicationPriority,
+      summary_config: summaryConfig,
       updated_at: new Date().toISOString()
     }
   });
@@ -520,9 +1157,63 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
   return refreshed[0];
 }
 
+async function updateRuleSummaryConfigViaApi(id: number, summaryConfigInput: unknown) {
+  const columns = await listBaseColumnsViaApi();
+  const summaryConfig = sanitizeRuleSummaryConfig(summaryConfigInput, columns);
+  const updated = await dataApiRequest<PublicationRule[]>(`/publish_rules?id=eq.${id}`, {
+    method: "PATCH",
+    prefer: "return=representation",
+    body: {
+      summary_config: summaryConfig,
+      updated_at: new Date().toISOString()
+    }
+  });
+  return updated[0] ?? null;
+}
+
 async function deleteRuleViaApi(id: number) {
   await dataApiRpc<PublicationRule[]>("drop_publish_rule_view", { rule_id: id });
   await dataApiRequest(`/publish_rules?id=eq.${id}`, { method: "DELETE" });
+}
+
+async function runRuleHealthchecksViaApi(ruleId?: number | null) {
+  return dataApiRpc<RuleHealthcheckStatus[]>("publish_rule_healthcheck", {
+    target_rule_id: ruleId ?? null
+  });
+}
+
+async function getRuleHealthcheckReportViaApi(ruleId: number | null, refresh: boolean): Promise<RuleHealthcheckReport> {
+  const cacheKey = `data-api|${ruleId ?? "all"}`;
+  if (!refresh && dataApiHealthcheckReportCache?.key === cacheKey && dataApiHealthcheckReportCache.expiresAt > Date.now()) {
+    return {
+      ...dataApiHealthcheckReportCache.value,
+      cached: true,
+      cache: {
+        ...dataApiHealthcheckReportCache.value.cache,
+        rule_hits: dataApiHealthcheckReportCache.value.rules.length,
+        rule_misses: 0
+      }
+    };
+  }
+
+  const report = await dataApiRpc<RuleHealthcheckReport>("publish_rule_healthcheck_report", {
+    target_rule_id: ruleId ?? null
+  });
+  const value: RuleHealthcheckReport = {
+    ...report,
+    cached: false,
+    cache: {
+      ttl_ms: HEALTHCHECK_REPORT_CACHE_MS,
+      rule_hits: 0,
+      rule_misses: report.rules.length
+    }
+  };
+  dataApiHealthcheckReportCache = {
+    key: cacheKey,
+    expiresAt: Date.now() + HEALTHCHECK_REPORT_CACHE_MS,
+    value
+  };
+  return value;
 }
 
 async function previewRuleViaApi(input: RuleInput) {
@@ -559,12 +1250,38 @@ async function previewRuleRowsViaApi(input: PreviewRowsInput) {
     ad_limit_type: input.ad_limit_type ?? "total",
     include_locked: input.include_locked ?? true,
     active: input.active ?? true,
-    preview_limit: input.limit === 100 ? 100 : 10
+    preview_limit: input.limit === 100 ? 100 : 10,
+    preview_sort_column: input.preview_sort_column ?? null,
+    preview_sort_direction: input.preview_sort_direction === "desc" ? "desc" : "asc"
+  });
+}
+
+async function previewRuleSummaryViaApi(_input: RuleSummaryInput): Promise<RuleSummaryResponse> {
+  const columns = await listBaseColumnsViaApi();
+  const filters = sanitizeFilters(_input.filters ?? DEFAULT_FILTERS, columns);
+  const publicationPriority = sanitizePublicationPriority(_input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+  const sourceTable = await validateSourceTableViaApi(_input.source_table);
+  return dataApiRpc<RuleSummaryResponse>("preview_publish_rule_summary", {
+    filters,
+    publication_priority: publicationPriority,
+    source_table: sourceTable,
+    portal_id: normalizePortalId(_input.portal_id),
+    use_ad_limit: _input.use_ad_limit ?? false,
+    ad_limit_type: _input.ad_limit_type ?? "total",
+    include_locked: _input.include_locked ?? true,
+    active: _input.active ?? true,
+    items: Array.isArray(_input.items) ? _input.items : []
   });
 }
 
 async function listBaseColumnsViaApi() {
-  return dataApiRpc<ColumnMetadata[]>("publish_base_columns");
+  if (dataApiColumnsCache && dataApiColumnsCache.expiresAt > Date.now()) {
+    return dataApiColumnsCache.columns;
+  }
+
+  const columns = await dataApiRpc<ColumnMetadata[]>("publish_base_columns");
+  dataApiColumnsCache = { columns, expiresAt: Date.now() + DATA_API_COLUMNS_CACHE_MS };
+  return columns;
 }
 
 async function assertPortalExistsViaApi(portalId: number) {
@@ -658,9 +1375,29 @@ function normalizePortalId(portalId?: number | string | null) {
   return normalized;
 }
 
+function normalizeOptionalPositiveInteger(value?: number | string | null) {
+  if (value == null || value === "") return null;
+  const normalized = Number(value);
+  if (!Number.isInteger(normalized) || normalized <= 0) throw new Error("Identificador invalido.");
+  return normalized;
+}
+
+function normalizePortalSlug(slug: string | null | undefined, fallbackName: string) {
+  const normalized = (slug?.trim() || slugify(fallbackName)).trim();
+  if (!normalized) throw new Error("Slug do portal e obrigatorio.");
+  if (!/^[a-z0-9_]+$/.test(normalized)) {
+    throw new Error("Slug do portal deve usar apenas letras minusculas, numeros e underscore.");
+  }
+  return normalized;
+}
+
 function normalizeAdLimitType(adLimitType?: string | null) {
   const normalized = normalizeAdTypeName(adLimitType || "total");
   return normalized || "total";
+}
+
+function adLimitTypeSlug(adLimitType: string) {
+  return slugify(normalizeAdTypeName(adLimitType));
 }
 
 async function normalizeRuleAdLimit(
@@ -817,13 +1554,384 @@ function sumPortalQuota(adTypes: PortalAdType[]) {
   return adTypes.reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
 }
 
+const HEALTHCHECK_REVERSE_SOURCE_TABLE = "imoveis_ativos";
+
+type HealthcheckRuleRow = Pick<
+  PublicationRule,
+  "id" | "portal_id" | "view_name" | "use_ad_limit" | "ad_limit_type"
+> & {
+  portal_slug: string | null;
+};
+
+type HealthcheckReportRuleRow = Pick<
+  PublicationRule,
+  | "id"
+  | "name"
+  | "slug"
+  | "view_name"
+  | "active"
+  | "use_ad_limit"
+  | "ad_limit_type"
+  | "health_expected_count"
+  | "health_published_count"
+  | "health_pending_count"
+  | "health_unexpected_count"
+  | "health_checked_at"
+  | "health_error"
+  | "updated_at"
+> & {
+  portal_id: number;
+  portal_name: string;
+  portal_slug: string;
+};
+
+function healthcheckReportRuleCacheKey(rule: HealthcheckReportRuleRow) {
+  return [
+    rule.id,
+    rule.view_name ?? "",
+    rule.portal_id,
+    rule.portal_slug,
+    rule.use_ad_limit ? "1" : "0",
+    rule.ad_limit_type ?? "",
+    rule.health_checked_at ?? "",
+    rule.updated_at ?? ""
+  ].join("|");
+}
+
+function trimHealthcheckReportRuleCache() {
+  if (healthcheckReportRuleCache.size <= 300) return;
+  const now = Date.now();
+  for (const [key, value] of healthcheckReportRuleCache) {
+    if (value.expiresAt <= now || healthcheckReportRuleCache.size > 220) {
+      healthcheckReportRuleCache.delete(key);
+    }
+  }
+}
+
+function healthcheckAdType(rule: Pick<PublicationRule, "use_ad_limit" | "ad_limit_type">) {
+  const name = rule.use_ad_limit && rule.ad_limit_type ? rule.ad_limit_type : "total";
+  return {
+    name,
+    slug: name === "total" ? "total" : adLimitTypeSlug(name),
+    is_total: name === "total"
+  };
+}
+
+function healthcheckPublishedPredicate(alias: string, portalSlug: string, adTypeSlug: string, shouldFilterType: boolean) {
+  const portalLiteral = quoteLiteral(portalSlug);
+  return [
+    `coalesce((${alias}.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) is true`,
+    shouldFilterType ? `${alias}.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteLiteral(adTypeSlug)}` : null
+  ].filter(Boolean).join(" and ");
+}
+
+function healthcheckPendingQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
+  if (!rule.view_name) return null;
+  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  return `
+select b.codigo_crm::text as codigo_crm
+from public.${quoteIdentifier(rule.view_name)} b
+where not (${healthcheckPublishedPredicate("b", rule.portal_slug, adTypeSlug, shouldFilterType)})
+order by b.codigo_crm
+`.trim();
+}
+
+function healthcheckUnexpectedQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
+  if (!rule.view_name) return null;
+  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  return `
+select ia.codigo_crm::text as codigo_crm
+from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
+where ${healthcheckPublishedPredicate("ia", rule.portal_slug, adTypeSlug, shouldFilterType)}
+  and not exists (
+    select 1
+    from public.${quoteIdentifier(rule.view_name)} p
+    where p.codigo_crm = ia.codigo_crm
+  )
+order by ia.codigo_crm
+`.trim();
+}
+
+async function buildHealthcheckReportRule(rule: HealthcheckReportRuleRow): Promise<RuleHealthcheckReportRule> {
+  const adType = healthcheckAdType(rule);
+  const baseReport: RuleHealthcheckReportRule = {
+    rule: {
+      id: rule.id,
+      name: rule.name,
+      slug: rule.slug,
+      view_name: rule.view_name,
+      active: rule.active
+    },
+    portal: {
+      id: rule.portal_id,
+      name: rule.portal_name,
+      slug: rule.portal_slug
+    },
+    ad_type: adType,
+    status: {
+      expected_count: rule.health_expected_count,
+      published_count: rule.health_published_count,
+      pending_count: rule.health_pending_count,
+      unexpected_count: rule.health_unexpected_count,
+      checked_at: rule.health_checked_at,
+      error: rule.health_error
+    },
+    codes: {
+      pending: [],
+      unexpected: []
+    },
+    queries: {
+      pending_codes: null,
+      unexpected_codes: null
+    },
+    error: rule.health_error
+  };
+
+  if (!rule.view_name) {
+    return { ...baseReport, error: baseReport.error ?? "View da regra ainda nao foi criada." };
+  }
+
+  const pendingQuery = healthcheckPendingQuery(rule, adType.slug);
+  const unexpectedQuery = healthcheckUnexpectedQuery(rule, adType.slug);
+  baseReport.queries.pending_codes = pendingQuery;
+  baseReport.queries.unexpected_codes = unexpectedQuery;
+
+  try {
+    const [pending, unexpected] = await Promise.all([
+      pendingQuery ? query<{ codigo_crm: string }>(pendingQuery) : Promise.resolve({ rows: [] } as { rows: Array<{ codigo_crm: string }> }),
+      unexpectedQuery ? query<{ codigo_crm: string }>(unexpectedQuery) : Promise.resolve({ rows: [] } as { rows: Array<{ codigo_crm: string }> })
+    ]);
+
+    return {
+      ...baseReport,
+      codes: {
+        pending: pending.rows.map((row) => row.codigo_crm),
+        unexpected: unexpected.rows.map((row) => row.codigo_crm)
+      }
+    };
+  } catch (error) {
+    return {
+      ...baseReport,
+      error: error instanceof Error ? error.message : "Erro ao montar detalhes do healthcheck."
+    };
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  callback: (item: T, index: number) => Promise<R>
+) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await callback(items[currentIndex], currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+async function runSingleRuleHealthcheck(rule: HealthcheckRuleRow): Promise<RuleHealthcheckStatus> {
+  const checkedAt = new Date().toISOString();
+
+  try {
+    if (!rule.portal_id || !rule.portal_slug) {
+      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "Regra sem portal vinculado.");
+    }
+
+    if (!rule.view_name) {
+      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "View da regra ainda nao foi criada.");
+    }
+
+    const viewExists = await query<{ exists: boolean }>(
+      `
+        select exists (
+          select 1
+          from pg_class c
+          join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = 'public'
+            and c.relkind in ('v', 'm')
+            and c.relname = $1
+        ) as exists
+      `,
+      [rule.view_name]
+    );
+    if (!viewExists.rows[0]?.exists) {
+      return updateRuleHealthcheckStatus(rule, null, null, null, null, checkedAt, "View da regra nao encontrada.");
+    }
+
+    const hasPublicationPortals = await query<{ exists: boolean }>(
+      `
+        select exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name = $1
+            and column_name = 'publicacao_portais'
+        ) as exists
+      `,
+      [rule.view_name]
+    );
+    if (!hasPublicationPortals.rows[0]?.exists) {
+      return updateRuleHealthcheckStatus(
+        rule,
+        null,
+        null,
+        null,
+        null,
+        checkedAt,
+        "Coluna publicacao_portais nao encontrada na view da regra."
+      );
+    }
+
+    const reverseSourceReady = await query<{ ready: boolean }>(
+      `
+        select exists (
+          select 1
+          from pg_class c
+          join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = 'public'
+            and c.relkind in ('r', 'v', 'm')
+            and c.relname = $1
+        )
+        and exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name = $1
+            and column_name = 'publicacao_portais'
+        )
+        and exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name = $1
+            and column_name = 'codigo_crm'
+        )
+        and exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name = $2
+            and column_name = 'codigo_crm'
+        ) as ready
+      `,
+      [HEALTHCHECK_REVERSE_SOURCE_TABLE, rule.view_name]
+    );
+    if (!reverseSourceReady.rows[0]?.ready) {
+      return updateRuleHealthcheckStatus(
+        rule,
+        null,
+        null,
+        null,
+        null,
+        checkedAt,
+        "Base imoveis_ativos ou coluna codigo_crm/publicacao_portais indisponivel para verificacao inversa."
+      );
+    }
+
+    const expected = await query<{ count: number }>(
+      `select count(*)::int as count from public.${quoteIdentifier(rule.view_name)}`
+    );
+    const expectedCount = expected.rows[0]?.count ?? 0;
+    const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+    const adLimitTypeFilter = shouldFilterType && rule.ad_limit_type ? adLimitTypeSlug(rule.ad_limit_type) : null;
+    const published = await query<{ count: number }>(
+      `
+        select count(*)::int as count
+        from public.${quoteIdentifier(rule.view_name)} b
+        where coalesce((b.publicacao_portais::jsonb -> $1 ->> 'publicado')::boolean, false) is true
+        ${shouldFilterType ? "and b.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
+      `,
+      shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
+    );
+    const publishedCount = published.rows[0]?.count ?? 0;
+    const unexpected = await query<{ count: number }>(
+      `
+        select count(*)::int as count
+        from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
+        where coalesce((ia.publicacao_portais::jsonb -> $1 ->> 'publicado')::boolean, false) is true
+          ${shouldFilterType ? "and ia.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
+          and not exists (
+            select 1
+            from public.${quoteIdentifier(rule.view_name)} p
+            where p.codigo_crm = ia.codigo_crm
+          )
+      `,
+      shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
+    );
+    const unexpectedCount = unexpected.rows[0]?.count ?? 0;
+    return updateRuleHealthcheckStatus(
+      rule,
+      expectedCount,
+      publishedCount,
+      Math.max(expectedCount - publishedCount, 0),
+      unexpectedCount,
+      checkedAt,
+      null
+    );
+  } catch (error) {
+    return updateRuleHealthcheckStatus(
+      rule,
+      null,
+      null,
+      null,
+      null,
+      checkedAt,
+      error instanceof Error ? error.message : "Erro ao executar healthcheck."
+    );
+  }
+}
+
+async function updateRuleHealthcheckStatus(
+  rule: HealthcheckRuleRow,
+  expectedCount: number | null,
+  publishedCount: number | null,
+  pendingCount: number | null,
+  unexpectedCount: number | null,
+  checkedAt: string,
+  error: string | null
+): Promise<RuleHealthcheckStatus> {
+  await query(
+    `
+      update publish_rules
+      set health_expected_count = $2,
+          health_published_count = $3,
+          health_pending_count = $4,
+          health_unexpected_count = $5,
+          health_checked_at = $6::timestamptz,
+          health_error = $7,
+          updated_at = now()
+      where id = $1
+    `,
+    [rule.id, expectedCount, publishedCount, pendingCount, unexpectedCount, checkedAt, error]
+  );
+
+  return {
+    rule_id: rule.id,
+    portal_id: rule.portal_id,
+    portal_slug: rule.portal_slug,
+    expected_count: expectedCount,
+    published_count: publishedCount,
+    pending_count: pendingCount,
+    unexpected_count: unexpectedCount,
+    checked_at: checkedAt,
+    error
+  };
+}
+
 async function refreshRuleView(
   client: PoolClient,
   id: number,
   viewName: string | null,
   rule: Pick<
     PublicationRule,
-    "portal_id" | "filters" | "source_table" | "active" | "include_locked" | "use_ad_limit" | "ad_limit_type" | "publication_priority"
+    "portal_id" | "filters" | "source_table" | "active" | "include_locked" | "use_ad_limit" | "ad_limit_type" | "publication_priority" | "summary_config"
   >
 ) {
   const targetViewName = viewName ?? `pc_rule_${id}`;

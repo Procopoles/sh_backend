@@ -64,9 +64,28 @@
   .portal-row,
   .portal-row.header,
   .rule-row,
-  .rule-row.header {
+  .rule-row.header,
+  .status-rule-card {
     grid-template-columns: 1fr;
     min-width: 0;
+  }
+
+  .status-rule-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .status-portal-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .status-portal-summary {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .healthcheck-badge {
+    grid-column: 1;
+    justify-self: start;
   }
 
   .portal-row.header,
@@ -87,6 +106,7 @@
   .portal-editor-panel .condition-row,
   .priority-row,
   .priority-group-row,
+  .summary-config-row,
   .group-preview {
     grid-template-columns: 1fr;
   }
@@ -97,6 +117,7 @@
   }
 
   .preview-rows-heading,
+  .rule-summary-heading,
   .filter-editor-heading,
   .filter-modal-heading,
   .panel-heading {
@@ -111,8 +132,20 @@
   .condition-remove-dock,
   .nested-filter-actions,
   .priority-actions,
-  .priority-add-actions {
+  .priority-add-actions,
+  .rule-summary-heading,
+  .summary-settings-actions {
     justify-content: flex-start;
+  }
+
+  .preview-sort-controls,
+  .preview-sort-select-wrap {
+    width: 100%;
+  }
+
+  .summary-calculation-options,
+  .summary-range-grid {
+    grid-template-columns: 1fr;
   }
 
   .condition-remove-dock,

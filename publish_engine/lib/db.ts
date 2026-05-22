@@ -107,8 +107,15 @@ async function runControlSchemaMigration(client: PoolClient) {
       include_locked boolean not null default true,
       filters jsonb not null default '{"combinator":"and","conditions":[]}'::jsonb,
       publication_priority jsonb not null default '[]'::jsonb,
+      summary_config jsonb,
       last_sql text,
       last_count integer,
+      health_expected_count integer,
+      health_published_count integer,
+      health_pending_count integer,
+      health_unexpected_count integer,
+      health_checked_at timestamptz,
+      health_error text,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now(),
       unique (portal_id, slug)
@@ -186,9 +193,41 @@ async function runControlSchemaMigration(client: PoolClient) {
 
   await client.query(`
     alter table if exists publish_rules
+    add column if not exists summary_config jsonb;
+  `);
+
+  await client.query(`
+    alter table if exists publish_rules
     add column if not exists use_ad_limit boolean not null default false,
     add column if not exists ad_limit_type text,
     add column if not exists last_limited_count integer;
+  `);
+
+  await client.query(`
+    alter table if exists publish_rules
+    add column if not exists health_expected_count integer,
+    add column if not exists health_published_count integer,
+    add column if not exists health_pending_count integer,
+    add column if not exists health_unexpected_count integer,
+    add column if not exists health_checked_at timestamptz,
+    add column if not exists health_error text;
+  `);
+
+  await client.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conrelid = 'publish_portals'::regclass
+          and conname = 'publish_portals_slug_format_check'
+      ) then
+        alter table publish_portals
+        add constraint publish_portals_slug_format_check
+        check (slug ~ '^[a-z0-9_]+$');
+      end if;
+    end
+    $$;
   `);
 
   await client.query(`

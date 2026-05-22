@@ -16,6 +16,21 @@ const sql = `
 alter table public.publish_portals
 add column if not exists logo_url text;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'publish_portals'::regclass
+      and conname = 'publish_portals_slug_format_check'
+  ) then
+    alter table public.publish_portals
+    add constraint publish_portals_slug_format_check
+    check (slug ~ '^[a-z0-9_]+$');
+  end if;
+end
+$$;
+
 alter table if exists public.publish_rules
 alter column portal_id drop not null;
 
@@ -33,9 +48,20 @@ alter table if exists public.publish_rules
 add column if not exists publication_priority jsonb not null default '[]'::jsonb;
 
 alter table if exists public.publish_rules
+add column if not exists summary_config jsonb;
+
+alter table if exists public.publish_rules
 add column if not exists use_ad_limit boolean not null default false,
 add column if not exists ad_limit_type text,
 add column if not exists last_limited_count integer;
+
+alter table if exists public.publish_rules
+add column if not exists health_expected_count integer,
+add column if not exists health_published_count integer,
+add column if not exists health_pending_count integer,
+add column if not exists health_unexpected_count integer,
+add column if not exists health_checked_at timestamptz,
+add column if not exists health_error text;
 
 create table if not exists public.publish_portal_ad_types (
   id serial primary key,
@@ -323,7 +349,9 @@ begin
   into json_path
   from (
     select part, ordinality
-    from jsonb_array_elements_text(coalesce(condition->'jsonPath', '[]'::jsonb)) with ordinality as raw_path(part, ordinality)
+    from jsonb_array_elements_text(
+      case when jsonb_typeof(condition->'jsonPath') = 'array' then condition->'jsonPath' else '[]'::jsonb end
+    ) with ordinality as raw_path(part, ordinality)
     where btrim(part) <> ''
       and length(part) <= 120
     order by ordinality
@@ -434,7 +462,10 @@ begin
   combinator := case when filters->>'combinator' = 'or' then ' or ' else ' and ' end;
 
   for filter_item in
-    select value from jsonb_array_elements(coalesce(filters->'conditions', '[]'::jsonb))
+    select value
+    from jsonb_array_elements(
+      case when jsonb_typeof(filters->'conditions') = 'array' then filters->'conditions' else '[]'::jsonb end
+    )
   loop
     if jsonb_typeof(filter_item->'conditions') = 'array' then
       item_sql := public.publish_filter_group_sql(filter_item, false);
@@ -490,7 +521,9 @@ begin
   into json_path
   from (
     select part, ordinality
-    from jsonb_array_elements_text(coalesce(condition->'jsonPath', '[]'::jsonb)) with ordinality as raw_path(part, ordinality)
+    from jsonb_array_elements_text(
+      case when jsonb_typeof(condition->'jsonPath') = 'array' then condition->'jsonPath' else '[]'::jsonb end
+    ) with ordinality as raw_path(part, ordinality)
     where btrim(part) <> ''
       and length(part) <= 120
     order by ordinality
@@ -538,7 +571,10 @@ declare
   item_ordinal integer := 0;
 begin
   for filter_item in
-    select value from jsonb_array_elements(coalesce(filters->'conditions', '[]'::jsonb))
+    select value
+    from jsonb_array_elements(
+      case when jsonb_typeof(filters->'conditions') = 'array' then filters->'conditions' else '[]'::jsonb end
+    )
   loop
     item_ordinal := item_ordinal + 1;
 
@@ -556,7 +592,9 @@ begin
       into json_path
       from (
         select part, ordinality
-        from jsonb_array_elements_text(coalesce(filter_item->'jsonPath', '[]'::jsonb)) with ordinality as raw_path(part, ordinality)
+        from jsonb_array_elements_text(
+          case when jsonb_typeof(filter_item->'jsonPath') = 'array' then filter_item->'jsonPath' else '[]'::jsonb end
+        ) with ordinality as raw_path(part, ordinality)
         where btrim(part) <> ''
           and length(part) <= 120
         order by ordinality
@@ -657,7 +695,9 @@ begin
   into json_path
   from (
     select part, ordinality
-    from jsonb_array_elements_text(coalesce(priority_item->'jsonPath', '[]'::jsonb)) with ordinality as raw_path(part, ordinality)
+    from jsonb_array_elements_text(
+      case when jsonb_typeof(priority_item->'jsonPath') = 'array' then priority_item->'jsonPath' else '[]'::jsonb end
+    ) with ordinality as raw_path(part, ordinality)
     where btrim(part) <> ''
       and length(part) <= 120
     order by ordinality
@@ -706,7 +746,9 @@ declare
 begin
   for priority_item in
     select value
-    from jsonb_array_elements(coalesce(publication_priority, '[]'::jsonb)) with ordinality as item(value, ordinality)
+    from jsonb_array_elements(
+      case when jsonb_typeof(publication_priority) = 'array' then publication_priority else '[]'::jsonb end
+    ) with ordinality as item(value, ordinality)
     order by ordinality
     limit 8
   loop
@@ -769,6 +811,7 @@ $$;
 
 drop function if exists public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer);
 drop function if exists public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer, integer, boolean, text);
+drop function if exists public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer, integer, boolean, text, text, text);
 
 create or replace function public.preview_publish_rule_rows(
   filters jsonb,
@@ -779,7 +822,9 @@ create or replace function public.preview_publish_rule_rows(
   preview_limit integer default 10,
   portal_id integer default null,
   use_ad_limit boolean default false,
-  ad_limit_type text default 'total'
+  ad_limit_type text default 'total',
+  preview_sort_column text default null,
+  preview_sort_direction text default 'asc'
 )
 returns jsonb
 language plpgsql
@@ -793,6 +838,9 @@ declare
   source_name text := coalesce(nullif(source_table, ''), 'base_imoveis');
   normalized_limit integer := case when preview_limit = 100 then 100 else 10 end;
   quota integer;
+  final_limit_sql text := '';
+  post_order_sql text;
+  sort_direction text := case when lower(coalesce(preview_sort_direction, 'asc')) = 'desc' then 'desc' else 'asc' end;
   columns_json jsonb := '[]'::jsonb;
   rows_json jsonb := '[]'::jsonb;
   object_parts text[] := array[]::text[];
@@ -814,8 +862,9 @@ begin
   order_sql := public.publish_order_by_sql(publication_priority);
   if use_ad_limit then
     quota := public.publish_ad_limit_quota(portal_id, ad_limit_type);
-    normalized_limit := least(normalized_limit, quota);
+    final_limit_sql := format('limit %s', greatest(quota, 0));
   end if;
+  post_order_sql := format('b.__preview_rule_order %s', sort_direction);
 
   select c.column_name
   into identifier_column
@@ -863,24 +912,739 @@ begin
   loop
     columns_json := columns_json || jsonb_build_object('key', preview_column.column_key, 'label', preview_column.column_label);
     object_parts := array_append(object_parts, quote_literal(preview_column.column_key) || ', ' || preview_column.column_sql);
+    if preview_column.column_key = preview_sort_column then
+      post_order_sql := format('%s %s nulls last, b.__preview_rule_order asc', preview_column.column_sql, sort_direction);
+    end if;
   end loop;
 
   execute format(
     'select coalesce(jsonb_agg(row_object), ''[]''::jsonb)
      from (
        select jsonb_build_object(%s) as row_object
-       from public.%I b
-       where %s%s
+       from (
+         select b.*, row_number() over () as __preview_rule_order
+         from (
+           select b.*
+           from public.%I b
+           where %s%s
+           %s
+         ) b
+       ) b
+       order by %s
        limit %s
      ) preview_rows',
     array_to_string(object_parts, ', '),
     source_name,
     where_sql,
     order_sql,
+    final_limit_sql,
+    post_order_sql,
     normalized_limit
   ) into rows_json;
 
   return jsonb_build_object('columns', columns_json, 'rows', rows_json);
+end
+$$;
+
+drop function if exists public.preview_publish_rule_summary(jsonb, boolean, boolean, text, jsonb, integer, boolean, text, jsonb);
+
+create or replace function public.preview_publish_rule_summary(
+  filters jsonb,
+  include_locked boolean default true,
+  active boolean default true,
+  source_table text default 'base_imoveis',
+  publication_priority jsonb default '[]'::jsonb,
+  portal_id integer default null,
+  use_ad_limit boolean default false,
+  ad_limit_type text default 'total',
+  items jsonb default '[]'::jsonb
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_catalog
+as $$
+declare
+  where_sql text;
+  order_sql text;
+  limit_sql text := '';
+  source_name text := coalesce(nullif(source_table, ''), 'base_imoveis');
+  selection_sql text;
+  total_count integer := 0;
+  summary_items jsonb := '[]'::jsonb;
+  summary_item jsonb;
+  target_column_name text;
+  data_type text;
+  filter_kind text;
+  json_path text[];
+  column_sql text;
+  label text;
+  calculation text;
+  group_count integer;
+  item_total_count integer;
+  filled_count integer;
+  empty_count integer;
+  distinct_count integer;
+  min_value text;
+  max_value text;
+  groups_json jsonb;
+  value_counts_json jsonb;
+  filled_sql text;
+  label_sql text;
+begin
+  if source_name <> 'base_imoveis' and not exists (
+    select 1
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public'
+      and c.relkind in ('v', 'm')
+      and c.relname = source_name
+  ) then
+    raise exception 'Preset inicial invalido: %', source_name using errcode = '22023';
+  end if;
+
+  where_sql := public.publish_where_sql(filters, include_locked, active);
+  order_sql := public.publish_order_by_sql(publication_priority);
+  if use_ad_limit then
+    limit_sql := format(' limit %s', public.publish_ad_limit_quota(portal_id, ad_limit_type));
+  end if;
+
+  selection_sql := format('select b.* from public.%I b where %s%s%s', source_name, where_sql, order_sql, limit_sql);
+  execute format('select count(*)::int from (%s) summary_selection', selection_sql) into total_count;
+
+  for summary_item in
+    select value
+    from jsonb_array_elements(
+      case when jsonb_typeof(items) = 'array' then items else '[]'::jsonb end
+    )
+  loop
+    target_column_name := summary_item->>'column';
+    if target_column_name is null or target_column_name = '' then
+      continue;
+    end if;
+
+    select c.data_type, public.publish_filter_kind(c.data_type)
+    into data_type, filter_kind
+    from information_schema.columns c
+    where c.table_schema = 'public'
+      and c.table_name = 'base_imoveis'
+      and c.column_name = target_column_name;
+
+    if data_type is null or filter_kind = 'other' then
+      continue;
+    end if;
+
+    select array_agg(path_item.part order by path_item.ordinality)
+    into json_path
+    from (
+      select part, ordinality
+      from jsonb_array_elements_text(
+        case when jsonb_typeof(summary_item->'jsonPath') = 'array' then summary_item->'jsonPath' else '[]'::jsonb end
+      ) with ordinality as raw_path(part, ordinality)
+      where btrim(part) <> ''
+        and length(part) <= 120
+      order by ordinality
+      limit 8
+    ) as path_item;
+
+    if filter_kind = 'json' and array_length(json_path, 1) > 0 then
+      filter_kind := summary_item->>'jsonValueKind';
+      if filter_kind not in ('text', 'number', 'boolean', 'datetime', 'json') then
+        filter_kind := 'text';
+      end if;
+      label := target_column_name || '.' || array_to_string(json_path, '.');
+    else
+      json_path := null;
+      label := target_column_name;
+    end if;
+
+    column_sql := public.publish_filter_value_sql(summary_item);
+    if column_sql is null then
+      continue;
+    end if;
+
+    calculation := case
+      when summary_item->>'calculation' in ('range', 'count', 'group') then summary_item->>'calculation'
+      else 'count'
+    end;
+    if calculation = 'range' and filter_kind not in ('number', 'datetime', 'text') then
+      calculation := 'count';
+    end if;
+
+    begin
+      group_count := (summary_item->>'groupCount')::integer;
+    exception when others then
+      group_count := 5;
+    end;
+    group_count := least(greatest(coalesce(group_count, 5), 2), 10);
+
+    if calculation = 'range' then
+      execute format($summary_range$
+        with final_selection as (%1$s)
+        select
+          count(*)::int,
+          count(%2$s)::int,
+          min(%2$s)::text,
+          max(%2$s)::text
+        from final_selection b
+      $summary_range$, selection_sql, column_sql)
+      into item_total_count, filled_count, min_value, max_value;
+
+      summary_items := summary_items || jsonb_build_array(jsonb_build_object(
+        'column', target_column_name,
+        'jsonPath', json_path,
+        'label', label,
+        'calculation', 'range',
+        'data_type', data_type,
+        'filter_kind', filter_kind,
+        'filled_count', coalesce(filled_count, 0),
+        'total_count', coalesce(item_total_count, 0),
+        'min', min_value,
+        'max', max_value
+      ));
+    elsif calculation = 'group' then
+      if filter_kind = 'number' then
+        execute format($summary_numeric_group$
+          with final_selection as (%1$s),
+          summary_values as (
+            select %2$s::numeric as value
+            from final_selection b
+            where %2$s is not null
+          ),
+          bounds as (
+            select
+              case
+                when min(value) = 0 and min(value) filter (where value <> 0) is not null then min(value) filter (where value <> 0)
+                else min(value)
+              end as min_value,
+              max(value) as max_value,
+              min(value) = 0 and min(value) filter (where value <> 0) is not null as ignore_zero_floor
+            from summary_values
+          ),
+          bucket_settings as (
+            select
+              bounds.*,
+              chosen_step.step,
+              floor(bounds.min_value / chosen_step.floor_unit) * chosen_step.floor_unit as floor_value
+            from bounds
+            left join lateral (
+              with raw as (
+                select (bounds.max_value - bounds.min_value) / %3$s as raw_step
+              ),
+              step_candidates as (
+                select
+                  factor * power(10::double precision, exponent)::numeric as step,
+                  power(10::double precision, exponent)::numeric as floor_unit,
+                  raw.raw_step
+                from raw
+                cross join lateral generate_series(
+                  floor(log(greatest(raw.raw_step::double precision, 1e-12)))::int - 1,
+                  floor(log(greatest(raw.raw_step::double precision, 1e-12)))::int + 12
+                ) as exponents(exponent)
+                cross join (values (1::numeric), (2::numeric), (5::numeric), (10::numeric)) factors(factor)
+                where raw.raw_step > 0
+              )
+              select step, floor_unit
+              from step_candidates
+              where step >= raw_step
+                and ceil((bounds.max_value - floor(bounds.min_value / floor_unit) * floor_unit) / step) <= %3$s
+              order by step
+              limit 1
+            ) chosen_step on bounds.min_value is not null and bounds.min_value <> bounds.max_value
+          ),
+          bucketed_raw as (
+            select
+              case
+                when bucket_settings.min_value is null then null
+                when bucket_settings.min_value = bucket_settings.max_value then 1
+                else least(
+                  greatest(floor((summary_values.value - bucket_settings.floor_value) / bucket_settings.step)::int + 1, 1),
+                  %3$s
+                )
+              end as bucket,
+              summary_values.value,
+              bucket_settings.min_value,
+              bucket_settings.max_value,
+              bucket_settings.floor_value,
+              bucket_settings.step
+            from summary_values
+            cross join bucket_settings
+            where bucket_settings.min_value is not null
+              and (not bucket_settings.ignore_zero_floor or summary_values.value <> 0)
+          ),
+          bucketed as (
+            select
+              bucket,
+              value,
+              case
+                when min_value = max_value then value
+                else floor_value + ((bucket - 1) * step)
+              end as bucket_min,
+              case
+                when min_value = max_value then value
+                else floor_value + (bucket * step)
+              end as bucket_max
+            from bucketed_raw
+          ),
+          grouped as (
+            select bucket::int,
+              min(bucket_min)::text as min_value,
+              max(bucket_max)::text as max_value,
+              count(*)::int as count
+            from bucketed
+            where bucket is not null
+            group by bucket
+            order by bucket
+          )
+          select coalesce(
+            jsonb_agg(
+              jsonb_build_object(
+                'label',
+                case
+                  when min_value is null and max_value is null then 'Sem valor'
+                  when min_value = max_value then min_value
+                  else coalesce(min_value, '-') || ' ate ' || coalesce(max_value, '-')
+                end,
+                'count', count,
+                'min', min_value,
+                'max', max_value
+              )
+              order by bucket
+            ),
+            '[]'::jsonb
+          )
+          from grouped
+        $summary_numeric_group$, selection_sql, column_sql, group_count)
+        into groups_json;
+      else
+        label_sql := 'coalesce(nullif(btrim(' || column_sql || '::text), ' || quote_literal('') || '), ' || quote_literal('Sem valor') || ')';
+        execute format($summary_exact_group$
+          with final_selection as (%1$s),
+          grouped as (
+            select %2$s as label, count(*)::int as count
+            from final_selection b
+            group by label
+            order by count desc, label asc
+            limit %3$s
+          )
+          select coalesce(jsonb_agg(jsonb_build_object('label', label, 'count', count)), '[]'::jsonb)
+          from grouped
+        $summary_exact_group$, selection_sql, label_sql, group_count)
+        into groups_json;
+      end if;
+
+      summary_items := summary_items || jsonb_build_array(jsonb_build_object(
+        'column', target_column_name,
+        'jsonPath', json_path,
+        'label', label,
+        'calculation', 'group',
+        'data_type', data_type,
+        'filter_kind', filter_kind,
+        'group_count', group_count,
+        'total_count', total_count,
+        'groups', coalesce(groups_json, '[]'::jsonb)
+      ));
+    else
+      if filter_kind in ('text', 'json') then
+        filled_sql := 'nullif(btrim(' || column_sql || '::text), ' || quote_literal('') || ')';
+        label_sql := 'coalesce(nullif(btrim(' || column_sql || '::text), ' || quote_literal('') || '), ' || quote_literal('Sem valor') || ')';
+      elsif filter_kind = 'boolean' then
+        filled_sql := column_sql;
+        label_sql := 'case when ' || column_sql || ' is true then ' || quote_literal('Verdadeiro') ||
+          ' when ' || column_sql || ' is false then ' || quote_literal('Falso') ||
+          ' else ' || quote_literal('Sem valor') || ' end';
+      else
+        filled_sql := column_sql;
+        label_sql := 'coalesce(' || column_sql || '::text, ' || quote_literal('Sem valor') || ')';
+      end if;
+
+      execute format($summary_count$
+        with final_selection as (%1$s),
+        summary_labels as (
+          select %2$s as filled_value, %3$s as label
+          from final_selection b
+        ),
+        stats as (
+          select
+            count(*)::int as total_count,
+            count(filled_value)::int as filled_count,
+            (count(*) - count(filled_value))::int as empty_count,
+            count(distinct label)::int as distinct_count
+          from summary_labels
+        ),
+        top_values as (
+          select label, count(*)::int as count
+          from summary_labels
+          group by label
+          order by count desc, label asc
+          limit 5
+        )
+        select
+          stats.total_count,
+          stats.filled_count,
+          stats.empty_count,
+          stats.distinct_count,
+          coalesce(
+            jsonb_agg(
+              jsonb_build_object('label', top_values.label, 'count', top_values.count)
+              order by top_values.count desc, top_values.label asc
+            ) filter (where top_values.label is not null),
+            '[]'::jsonb
+          )
+        from stats
+        left join top_values on true
+        group by stats.total_count, stats.filled_count, stats.empty_count, stats.distinct_count
+      $summary_count$, selection_sql, filled_sql, label_sql)
+      into item_total_count, filled_count, empty_count, distinct_count, value_counts_json;
+
+      summary_items := summary_items || jsonb_build_array(jsonb_build_object(
+        'column', target_column_name,
+        'jsonPath', json_path,
+        'label', label,
+        'calculation', 'count',
+        'data_type', data_type,
+        'filter_kind', filter_kind,
+        'filled_count', coalesce(filled_count, 0),
+        'empty_count', coalesce(empty_count, 0),
+        'distinct_count', coalesce(distinct_count, 0),
+        'total_count', coalesce(item_total_count, 0),
+        'value_count_limit', 5,
+        'values', coalesce(value_counts_json, '[]'::jsonb)
+      ));
+    end if;
+  end loop;
+
+  return jsonb_build_object('total', total_count, 'items', summary_items);
+end
+$$;
+
+drop function if exists public.publish_rule_healthcheck(integer);
+
+create or replace function public.publish_rule_healthcheck(target_rule_id integer default null)
+returns table (
+  rule_id integer,
+  portal_id integer,
+  portal_slug text,
+  expected_count integer,
+  published_count integer,
+  pending_count integer,
+  unexpected_count integer,
+  checked_at timestamptz,
+  error text
+)
+language plpgsql
+security definer
+set search_path = public, pg_catalog
+as $$
+declare
+  rule_row record;
+  has_publicacao_portais boolean;
+  reverse_source_ready boolean;
+  should_filter_type boolean;
+  ad_limit_type_slug text;
+begin
+  for rule_row in
+    select r.id, r.portal_id, r.view_name, r.use_ad_limit, r.ad_limit_type, p.slug as portal_slug
+    from public.publish_rules r
+    left join public.publish_portals p on p.id = r.portal_id
+    where target_rule_id is null or r.id = target_rule_id
+    order by r.updated_at desc, r.id desc
+  loop
+    rule_id := rule_row.id;
+    portal_id := rule_row.portal_id;
+    portal_slug := rule_row.portal_slug;
+    expected_count := null;
+    published_count := null;
+    pending_count := null;
+    unexpected_count := null;
+    checked_at := now();
+    error := null;
+
+    begin
+      if rule_row.portal_id is null or rule_row.portal_slug is null or rule_row.portal_slug = '' then
+        error := 'Regra sem portal vinculado.';
+      elsif rule_row.view_name is null or rule_row.view_name = '' then
+        error := 'View da regra ainda nao foi criada.';
+      elsif not exists (
+        select 1
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public'
+          and c.relkind in ('v', 'm')
+          and c.relname = rule_row.view_name
+      ) then
+        error := 'View da regra nao encontrada.';
+      else
+        select exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name = rule_row.view_name
+            and column_name = 'publicacao_portais'
+        ) into has_publicacao_portais;
+
+        if not has_publicacao_portais then
+          error := 'Coluna publicacao_portais nao encontrada na view da regra.';
+        else
+          select exists (
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'public'
+              and c.relkind in ('r', 'v', 'm')
+              and c.relname = 'imoveis_ativos'
+          )
+          and exists (
+            select 1
+            from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'imoveis_ativos'
+              and column_name = 'publicacao_portais'
+          )
+          and exists (
+            select 1
+            from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'imoveis_ativos'
+              and column_name = 'codigo_crm'
+          )
+          and exists (
+            select 1
+            from information_schema.columns
+            where table_schema = 'public'
+              and table_name = rule_row.view_name
+              and column_name = 'codigo_crm'
+          ) into reverse_source_ready;
+
+          if not reverse_source_ready then
+            error := 'Base imoveis_ativos ou coluna codigo_crm/publicacao_portais indisponivel para verificacao inversa.';
+          else
+            execute format('select count(*)::int from public.%I', rule_row.view_name)
+            into expected_count;
+
+            should_filter_type := rule_row.use_ad_limit
+              and coalesce(rule_row.ad_limit_type, '') <> ''
+              and rule_row.ad_limit_type <> 'total';
+            ad_limit_type_slug := public.publish_slugify(rule_row.ad_limit_type);
+
+            if should_filter_type then
+              execute format(
+                'select count(*)::int from public.%I b where coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and b.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L',
+                rule_row.view_name,
+                rule_row.portal_slug,
+                rule_row.portal_slug,
+                ad_limit_type_slug
+              ) into published_count;
+            else
+              execute format(
+                'select count(*)::int from public.%I b where coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true',
+                rule_row.view_name,
+                rule_row.portal_slug
+              ) into published_count;
+            end if;
+
+            if should_filter_type then
+              execute format(
+                'select count(*)::int from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and ia.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm)',
+                rule_row.portal_slug,
+                rule_row.portal_slug,
+                ad_limit_type_slug,
+                rule_row.view_name
+              ) into unexpected_count;
+            else
+              execute format(
+                'select count(*)::int from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm)',
+                rule_row.portal_slug,
+                rule_row.view_name
+              ) into unexpected_count;
+            end if;
+
+            pending_count := greatest(coalesce(expected_count, 0) - coalesce(published_count, 0), 0);
+          end if;
+        end if;
+      end if;
+    exception when others then
+      expected_count := null;
+      published_count := null;
+      pending_count := null;
+      unexpected_count := null;
+      error := sqlerrm;
+    end;
+
+    update public.publish_rules
+    set health_expected_count = expected_count,
+        health_published_count = published_count,
+        health_pending_count = pending_count,
+        health_unexpected_count = unexpected_count,
+        health_checked_at = checked_at,
+        health_error = error,
+        updated_at = now()
+    where id = rule_row.id;
+
+    return next;
+  end loop;
+end
+$$;
+
+drop function if exists public.publish_rule_healthcheck_report(integer);
+
+create or replace function public.publish_rule_healthcheck_report(target_rule_id integer default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_catalog
+as $$
+declare
+  rule_row record;
+  should_filter_type boolean;
+  ad_limit_type_name text;
+  ad_limit_type_slug text;
+  pending_query text;
+  unexpected_query text;
+  pending_codes jsonb;
+  unexpected_codes jsonb;
+  rules_json jsonb := '[]'::jsonb;
+  rule_error text;
+begin
+  for rule_row in
+    select r.id,
+           r.name,
+           r.slug,
+           r.view_name,
+           r.active,
+           r.use_ad_limit,
+           r.ad_limit_type,
+           r.health_expected_count,
+           r.health_published_count,
+           r.health_pending_count,
+           r.health_unexpected_count,
+           r.health_checked_at,
+           r.health_error,
+           p.id as portal_id,
+           p.name as portal_name,
+           p.slug as portal_slug
+    from public.publish_rules r
+    join public.publish_portals p on p.id = r.portal_id
+    where r.active = true
+      and (target_rule_id is null or r.id = target_rule_id)
+    order by p.name asc, r.name asc, r.id asc
+  loop
+    pending_codes := '[]'::jsonb;
+    unexpected_codes := '[]'::jsonb;
+    pending_query := null;
+    unexpected_query := null;
+    rule_error := rule_row.health_error;
+    ad_limit_type_name := case
+      when rule_row.use_ad_limit and coalesce(rule_row.ad_limit_type, '') <> '' then rule_row.ad_limit_type
+      else 'total'
+    end;
+    ad_limit_type_slug := case
+      when ad_limit_type_name = 'total' then 'total'
+      else public.publish_slugify(ad_limit_type_name)
+    end;
+    should_filter_type := rule_row.use_ad_limit
+      and coalesce(rule_row.ad_limit_type, '') <> ''
+      and rule_row.ad_limit_type <> 'total';
+
+    begin
+      if rule_row.view_name is null or rule_row.view_name = '' then
+        rule_error := coalesce(rule_error, 'View da regra ainda nao foi criada.');
+      else
+        pending_query := case when should_filter_type then
+          format(
+            'select b.codigo_crm::text as codigo_crm from public.%I b where not (coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and b.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L) order by b.codigo_crm',
+            rule_row.view_name,
+            rule_row.portal_slug,
+            rule_row.portal_slug,
+            ad_limit_type_slug
+          )
+        else
+          format(
+            'select b.codigo_crm::text as codigo_crm from public.%I b where not (coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true) order by b.codigo_crm',
+            rule_row.view_name,
+            rule_row.portal_slug
+          )
+        end;
+
+        unexpected_query := case when should_filter_type then
+          format(
+            'select ia.codigo_crm::text as codigo_crm from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and ia.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm) order by ia.codigo_crm',
+            rule_row.portal_slug,
+            rule_row.portal_slug,
+            ad_limit_type_slug,
+            rule_row.view_name
+          )
+        else
+          format(
+            'select ia.codigo_crm::text as codigo_crm from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm) order by ia.codigo_crm',
+            rule_row.portal_slug,
+            rule_row.view_name
+          )
+        end;
+
+        execute format('select coalesce(jsonb_agg(codigo_crm order by codigo_crm), ''[]''::jsonb) from (%s) codes', pending_query)
+        into pending_codes;
+
+        execute format('select coalesce(jsonb_agg(codigo_crm order by codigo_crm), ''[]''::jsonb) from (%s) codes', unexpected_query)
+        into unexpected_codes;
+      end if;
+    exception when others then
+      pending_codes := '[]'::jsonb;
+      unexpected_codes := '[]'::jsonb;
+      rule_error := sqlerrm;
+    end;
+
+    rules_json := rules_json || jsonb_build_array(
+      jsonb_build_object(
+        'rule', jsonb_build_object(
+          'id', rule_row.id,
+          'name', rule_row.name,
+          'slug', rule_row.slug,
+          'view_name', rule_row.view_name,
+          'active', rule_row.active
+        ),
+        'portal', jsonb_build_object(
+          'id', rule_row.portal_id,
+          'name', rule_row.portal_name,
+          'slug', rule_row.portal_slug
+        ),
+        'ad_type', jsonb_build_object(
+          'name', ad_limit_type_name,
+          'slug', ad_limit_type_slug,
+          'is_total', ad_limit_type_name = 'total'
+        ),
+        'status', jsonb_build_object(
+          'expected_count', rule_row.health_expected_count,
+          'published_count', rule_row.health_published_count,
+          'pending_count', rule_row.health_pending_count,
+          'unexpected_count', rule_row.health_unexpected_count,
+          'checked_at', rule_row.health_checked_at,
+          'error', rule_row.health_error
+        ),
+        'codes', jsonb_build_object(
+          'pending', pending_codes,
+          'unexpected', unexpected_codes
+        ),
+        'queries', jsonb_build_object(
+          'pending_codes', pending_query,
+          'unexpected_codes', unexpected_query
+        ),
+        'error', rule_error
+      )
+    );
+  end loop;
+
+  return jsonb_build_object(
+    'generated_at', now(),
+    'cached', false,
+    'cache', jsonb_build_object(
+      'ttl_ms', 0,
+      'rule_hits', 0,
+      'rule_misses', jsonb_array_length(rules_json)
+    ),
+    'rules', rules_json
+  );
 end
 $$;
 
@@ -1025,7 +1789,10 @@ grant execute on function public.publish_preview_filter_columns(jsonb) to servic
 grant execute on function public.publish_priority_item_sql(jsonb) to service_role;
 grant execute on function public.publish_order_by_sql(jsonb) to service_role;
 grant execute on function public.preview_publish_rule(jsonb, boolean, boolean, text, integer, boolean, text) to service_role;
-grant execute on function public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer, integer, boolean, text) to service_role;
+grant execute on function public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer, integer, boolean, text, text, text) to service_role;
+grant execute on function public.preview_publish_rule_summary(jsonb, boolean, boolean, text, jsonb, integer, boolean, text, jsonb) to service_role;
+grant execute on function public.publish_rule_healthcheck(integer) to service_role;
+grant execute on function public.publish_rule_healthcheck_report(integer) to service_role;
 grant execute on function public.refresh_publish_rule_view(integer) to service_role;
 grant execute on function public.drop_publish_rule_view(integer) to service_role;
 

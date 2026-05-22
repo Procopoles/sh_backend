@@ -64,6 +64,7 @@ export type PublicationRule = {
   id: number;
   portal_id: number | null;
   portal_name?: string;
+  portal_slug?: string;
   name: string;
   slug: string;
   description: string | null;
@@ -75,11 +76,140 @@ export type PublicationRule = {
   ad_limit_type: string | null;
   filters: RuleFilters;
   publication_priority: PublicationPriority;
+  summary_config: RuleSummaryConfigItem[] | null;
   last_sql: string | null;
   last_count: number | null;
   last_limited_count: number | null;
+  health_expected_count: number | null;
+  health_published_count: number | null;
+  health_pending_count: number | null;
+  health_unexpected_count: number | null;
+  health_checked_at: string | null;
+  health_error: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type RuleHealthcheckStatus = {
+  rule_id: number;
+  portal_id: number | null;
+  portal_slug: string | null;
+  expected_count: number | null;
+  published_count: number | null;
+  pending_count: number | null;
+  unexpected_count: number | null;
+  checked_at: string | null;
+  error: string | null;
+};
+
+export type RuleHealthcheckReportRule = {
+  rule: {
+    id: number;
+    name: string;
+    slug: string;
+    view_name: string | null;
+    active: boolean;
+  };
+  portal: {
+    id: number;
+    name: string;
+    slug: string;
+  };
+  ad_type: {
+    name: string;
+    slug: string;
+    is_total: boolean;
+  };
+  status: {
+    expected_count: number | null;
+    published_count: number | null;
+    pending_count: number | null;
+    unexpected_count: number | null;
+    checked_at: string | null;
+    error: string | null;
+  };
+  codes: {
+    pending: string[];
+    unexpected: string[];
+  };
+  queries: {
+    pending_codes: string | null;
+    unexpected_codes: string | null;
+  };
+  error: string | null;
+};
+
+export type RuleHealthcheckReport = {
+  generated_at: string;
+  cached: boolean;
+  cache: {
+    ttl_ms: number;
+    rule_hits: number;
+    rule_misses: number;
+  };
+  rules: RuleHealthcheckReportRule[];
+};
+
+export type RuleSummaryCalculation = "range" | "count" | "group";
+
+export type RuleSummaryConfigItem = {
+  column: string;
+  jsonPath?: string[] | null;
+  jsonValueKind?: ColumnMetadata["filter_kind"] | null;
+  calculation: RuleSummaryCalculation;
+  groupCount?: number | null;
+};
+
+export type RuleSummaryItemResult =
+  | {
+      column: string;
+      jsonPath?: string[] | null;
+      label: string;
+      calculation: "range";
+      data_type: string;
+      filter_kind: ColumnMetadata["filter_kind"];
+      filled_count: number;
+      total_count: number;
+      min: string | null;
+      max: string | null;
+    }
+  | {
+      column: string;
+      jsonPath?: string[] | null;
+      label: string;
+      calculation: "count";
+      data_type: string;
+      filter_kind: ColumnMetadata["filter_kind"];
+      filled_count: number;
+      empty_count: number;
+      distinct_count: number;
+      total_count: number;
+      value_count_limit: number;
+      values: Array<{
+        label: string;
+        count: number;
+      }>;
+    }
+  | {
+      column: string;
+      jsonPath?: string[] | null;
+      label: string;
+      calculation: "group";
+      data_type: string;
+      filter_kind: ColumnMetadata["filter_kind"];
+      group_count: number;
+      total_count: number;
+      groups: Array<{
+        label: string;
+        count: number;
+        min?: string | null;
+        max?: string | null;
+      }>;
+    };
+
+export type RuleSummaryResponse = {
+  total: number;
+  items: RuleSummaryItemResult[];
 };
 
 export type ColumnMetadata = {

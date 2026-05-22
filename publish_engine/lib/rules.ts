@@ -29,6 +29,9 @@ const JSON_PATH_LIMIT = 8;
 const JSON_FIELD_LIMIT = 80;
 const JSON_FIELD_SAMPLE_LIMIT = 300;
 const JSON_VALUE_KINDS: ColumnMetadata["filter_kind"][] = ["text", "number", "boolean", "datetime", "json"];
+const BASE_COLUMNS_CACHE_MS = 5 * 60 * 1000;
+
+let baseColumnsCache: { expiresAt: number; columns: ColumnMetadata[] } | null = null;
 
 export const DEFAULT_FILTERS: RuleFilters = { combinator: "and", conditions: [] };
 export const DEFAULT_PUBLICATION_PRIORITY: PublicationPriority = [];
@@ -242,6 +245,10 @@ function sanitizePublicationPrioritySortItem(
 }
 
 export async function getBaseColumns(client: PoolClient): Promise<ColumnMetadata[]> {
+  if (baseColumnsCache && baseColumnsCache.expiresAt > Date.now()) {
+    return baseColumnsCache.columns;
+  }
+
   const result = await client.query<ColumnMetadata>(`
     select column_name, data_type, udt_name, is_nullable,
       case
@@ -264,10 +271,12 @@ export async function getBaseColumns(client: PoolClient): Promise<ColumnMetadata
     jsonFields.push(...(await getJsonColumnFields(client, column)));
   }
 
-  return result.rows.flatMap((column) => [
+  const columns = result.rows.flatMap((column) => [
     column,
     ...jsonFields.filter((field) => field.column_name === column.column_name)
   ]);
+  baseColumnsCache = { columns, expiresAt: Date.now() + BASE_COLUMNS_CACHE_MS };
+  return columns;
 }
 
 export function buildWhereSql(
@@ -336,19 +345,36 @@ export function buildRuleRowsPreviewQuery(
   columns: ColumnMetadata[],
   includeLocked: boolean,
   active: boolean,
-  limit: number,
-  publicationPriority: PublicationPriority = DEFAULT_PUBLICATION_PRIORITY
+  previewLimitInput: number,
+  publicationPriority: PublicationPriority = DEFAULT_PUBLICATION_PRIORITY,
+  finalLimit: number | null = null,
+  previewSortColumnKey: string | null = null,
+  previewSortDirection: "asc" | "desc" = "asc"
 ) {
-  const previewLimit = limit === 100 ? 100 : 10;
+  const previewLimit = previewLimitInput === 100 ? 100 : 10;
   const where = active ? buildWhereSql(filters, columns, includeLocked, true) : { whereSql: "false", params: [] };
   const previewColumns = previewColumnsForFilters(filters, columns);
   const selectParts = previewColumns.map((column) => `${column.sql} as ${quoteIdentifier(column.key)}`);
   const orderBySql = buildOrderBySql(publicationPriority, columns);
+  const finalLimitSql = finalLimit == null ? "" : `\nlimit ${Math.max(0, Math.floor(finalLimit))}`;
+  const sortDirection = previewSortDirection === "desc" ? "desc" : "asc";
+  const sortColumn = previewColumns.find((column) => column.key === previewSortColumnKey);
+  const previewOrderBySql = sortColumn
+    ? `${sortColumn.sql} ${sortDirection} nulls last, b.__preview_rule_order asc`
+    : `b.__preview_rule_order ${sortDirection}`;
 
   return {
-    sql: `select ${selectParts.join(", ")}
-from public.${quoteIdentifier(sourceTable)} b
-where ${where.whereSql}${orderBySql}
+    sql: `with final_selection as (
+  select b.*, row_number() over () as __preview_rule_order
+  from (
+    select b.*
+    from public.${quoteIdentifier(sourceTable)} b
+    where ${where.whereSql}${orderBySql}${finalLimitSql}
+  ) b
+)
+select ${selectParts.join(", ")}
+from final_selection b
+order by ${previewOrderBySql}
 limit ${previewLimit}`,
     params: where.params,
     columns: previewColumns.map(({ key, label }) => ({ key, label }))
@@ -531,16 +557,27 @@ function resolveSortableTarget(item: PublicationPrioritySortItem, lookup: Column
   return target;
 }
 
+export function resolveRuleColumnTarget(
+  columns: ColumnMetadata[],
+  columnName: string,
+  rawJsonPath: unknown,
+  rawJsonValueKind: unknown,
+  tableAlias = "b"
+) {
+  return resolveColumnTarget(columnName, rawJsonPath, rawJsonValueKind, createColumnLookup(columns), tableAlias);
+}
+
 function resolveColumnTarget(
   columnName: string,
   rawJsonPath: unknown,
   rawJsonValueKind: unknown,
-  lookup: ColumnLookup
+  lookup: ColumnLookup,
+  tableAlias = "b"
 ) {
   const baseMetadata = lookup.baseColumns.get(columnName);
   if (!baseMetadata) return null;
 
-  const baseColumnSql = `b.${quoteIdentifier(baseMetadata.column_name)}`;
+  const baseColumnSql = `${quoteIdentifier(tableAlias)}.${quoteIdentifier(baseMetadata.column_name)}`;
   const jsonPath = baseMetadata.filter_kind === "json" ? sanitizeJsonPath(rawJsonPath) : [];
 
   if (!jsonPath.length) {

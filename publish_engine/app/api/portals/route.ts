@@ -19,6 +19,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Nome é obrigatório." }, { status: 400 });
     }
 
+    if (!body.slug?.trim()) {
+      return NextResponse.json({ error: "Slug e obrigatorio." }, { status: 400 });
+    }
+    if (!/^[a-z0-9_]+$/.test(body.slug.trim())) {
+      return NextResponse.json({ error: "Slug deve usar apenas letras minusculas, numeros e underscore." }, { status: 400 });
+    }
+
     return NextResponse.json({ portal: await createPortal(body) }, { status: 201 });
   } catch (error) {
     return apiErrorResponse("POST /api/portals", error, "Erro ao criar portal.");

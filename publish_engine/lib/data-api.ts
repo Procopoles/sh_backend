@@ -76,6 +76,7 @@ export async function dataApiRequest<T>(path: string, options: RequestOptions = 
       requestId,
       method,
       path,
+      requestBody: summarizeJson(options.body),
       elapsedMs: Date.now() - startedAt,
       dataApi: getDataApiDiagnostics(),
       error: serializeError(error)
@@ -96,6 +97,7 @@ export async function dataApiRequest<T>(path: string, options: RequestOptions = 
       status: response.status,
       statusText: response.statusText,
       elapsedMs,
+      requestBody: summarizeJson(options.body),
       postgrest: getPostgrestError(data),
       responseBody: summarizeText(text),
       dataApi: getDataApiDiagnostics()
@@ -190,6 +192,13 @@ function getPostgrestError(data: unknown) {
 
 function summarizeText(text: string) {
   if (!text) return "";
+  return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
+}
+
+function summarizeJson(value: unknown) {
+  if (value === undefined) return undefined;
+  const text = JSON.stringify(value);
+  if (!text) return undefined;
   return text.length > 2000 ? `${text.slice(0, 2000)}...<truncated>` : text;
 }
 

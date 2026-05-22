@@ -1,14 +1,16 @@
 ﻿"use client";
 
-import { Filter, Globe2, Image, Loader2, Search } from "lucide-react";
+import { ArrowDownAZ, ArrowUpAZ, Filter, Globe2, Image, ListOrdered, Loader2, Search } from "lucide-react";
 import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
 import "./page.css";
 import { FilterGroupBuilder } from "./_components/filter-group-builder";
 import { MaterialIcon } from "./_components/material-icon";
 import { NumericInput } from "./_components/numeric-input";
 import { PublicationPriorityEditor, publicationPrioritySummary } from "./_components/publication-priority-editor";
+import { RuleSummarySection } from "./_components/rule-summary-section";
 import { formatNumber, isNumericValue, localizedNumberToNumber } from "./_lib/number-format";
 import { EMPTY_FILTERS, EMPTY_PORTAL, EMPTY_PUBLICATION_PRIORITY, type ActiveView, type MetadataResponse, type PanelMode, type PortalForm, type RuleForm } from "./_lib/page-models";
+import { createDefaultRuleSummaryConfig } from "./_lib/rule-summary-defaults";
 import {
   cloneGroup,
   createDefaultGroup,
@@ -18,7 +20,17 @@ import {
   replaceGroupAtPath
 } from "./_lib/rule-filter-utils";
 import { buildAdLimitSql, buildRuleSelectSql, sanitizeFilters, sanitizePublicationPriority } from "@/lib/rules";
-import type { Portal, PortalAdType, PublicationPriority, PublicationRule, RuleFilterGroup, RuleFilters } from "@/lib/types";
+import type {
+  Portal,
+  PortalAdType,
+  PublicationPriority,
+  PublicationRule,
+  RuleFilterGroup,
+  RuleFilters,
+  RuleHealthcheckStatus,
+  RuleSummaryConfigItem,
+  RuleSummaryResponse
+} from "@/lib/types";
 
 type RuleRowsPreview = {
   columns: Array<{ key: string; label: string }>;
@@ -30,16 +42,35 @@ type RulePreview = {
   limited_count?: number | null;
 };
 
+type PreviewSortDirection = "asc" | "desc";
+
 type RuleTreeRow = {
   rule: PublicationRule;
   depth: number;
   parentRule?: PublicationRule;
 };
 
+const PREVIEW_RULE_ORDER_COLUMN = "__rule_order__";
+const HEALTHCHECK_INTERVAL_MINUTES = Math.max(
+  1,
+  Number(process.env.NEXT_PUBLIC_RULE_HEALTHCHECK_INTERVAL_MINUTES ?? "5") || 5
+);
+const HEALTHCHECK_INTERVAL_MS = HEALTHCHECK_INTERVAL_MINUTES * 60 * 1000;
+const PORTAL_SLUG_HELP =
+  "Identificador interno do portal usado pelo sistema. Deve corresponder exatamente a chave em publicacao_portais na base_imoveis, como grupo_zap, imovel_web ou chaves_na_mao. Use minusculas, numeros e _ sem espacos.";
+
 function displayValue(value: string | number | null | undefined) {
   if (typeof value === "number") return formatNumber(value);
   const text = String(value ?? "").trim();
   return text || "-";
+}
+
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("pt-BR", {
+    dateStyle: "short",
+    timeStyle: "short"
+  }).format(new Date(value));
 }
 
 function adLimitTypeLabel(value: string | null | undefined) {
@@ -64,6 +95,73 @@ function ruleDeltaTone(value: number) {
   if (value > 0) return "positive";
   if (value < 0) return "negative";
   return "neutral";
+}
+
+function ruleHealthTone(rule: PublicationRule) {
+  if (rule.health_error) return "error";
+  if (rule.health_pending_count == null || rule.health_unexpected_count == null) return "unknown";
+  return rule.health_pending_count > 0 || rule.health_unexpected_count > 0 ? "warning" : "ok";
+}
+
+function quoteSqlIdentifier(value: string) {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteSqlLiteral(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function statusAdTypeSlug(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function statusLabel(rule: PublicationRule) {
+  if (rule.health_error) return "Erro";
+  if (rule.health_pending_count == null || rule.health_unexpected_count == null) return "Pendente";
+  return rule.health_pending_count > 0 || rule.health_unexpected_count > 0 ? "Divergente" : "OK";
+}
+
+function buildStatusPublishedQuery(rule: PublicationRule) {
+  if (!rule.view_name || !rule.portal_slug) return "View ou portal indisponivel para montar a query.";
+
+  const portalLiteral = quoteSqlLiteral(rule.portal_slug);
+  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  const typeFilter = shouldFilterType && rule.ad_limit_type
+    ? `\n  AND b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
+    : "";
+
+  return [
+    "SELECT count(*)::int AS count",
+    `FROM public.${quoteSqlIdentifier(rule.view_name)} b`,
+    `WHERE COALESCE((b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter};`
+  ].join("\n");
+}
+
+function buildStatusUnexpectedQuery(rule: PublicationRule) {
+  if (!rule.view_name || !rule.portal_slug) return "View ou portal indisponivel para montar a query.";
+
+  const portalLiteral = quoteSqlLiteral(rule.portal_slug);
+  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
+  const typeFilter = shouldFilterType && rule.ad_limit_type
+    ? `\n  AND ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
+    : "";
+
+  return [
+    "SELECT ia.*",
+    "FROM public.imoveis_ativos ia",
+    `WHERE COALESCE((ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter}`,
+    "  AND NOT EXISTS (",
+    "    SELECT 1",
+    `    FROM public.${quoteSqlIdentifier(rule.view_name)} p`,
+    "    WHERE p.codigo_crm = ia.codigo_crm",
+    "  )",
+    "LIMIT 100;"
+  ].join("\n");
 }
 
 function RuleCountCell({ rule }: { rule: PublicationRule }) {
@@ -173,6 +271,14 @@ export default function Home() {
   const [previewRowsLimit, setPreviewRowsLimit] = useState<10 | 100>(10);
   const [previewRows, setPreviewRows] = useState<RuleRowsPreview | null>(null);
   const [previewRowsLoading, setPreviewRowsLoading] = useState(false);
+  const [previewSortColumn, setPreviewSortColumn] = useState(PREVIEW_RULE_ORDER_COLUMN);
+  const [previewSortDirection, setPreviewSortDirection] = useState<PreviewSortDirection>("asc");
+  const [summaryConfig, setSummaryConfig] = useState<RuleSummaryConfigItem[]>([]);
+  const [summaryConfigCustom, setSummaryConfigCustom] = useState(false);
+  const [ruleSummary, setRuleSummary] = useState<RuleSummaryResponse | null>(null);
+  const [ruleSummaryLoading, setRuleSummaryLoading] = useState(false);
+  const [healthcheckLoading, setHealthcheckLoading] = useState(false);
+  const [selectedStatusRuleId, setSelectedStatusRuleId] = useState<number | null>(null);
   const [queryPanelOpen, setQueryPanelOpen] = useState(false);
   const [queryCopied, setQueryCopied] = useState(false);
   const [viewNameCopied, setViewNameCopied] = useState(false);
@@ -191,7 +297,17 @@ export default function Home() {
     () => metadata?.columns.filter((column) => column.filter_kind !== "other") ?? [],
     [metadata]
   );
-
+  const defaultSummaryConfig = useMemo(
+    () =>
+      ruleForm
+        ? createDefaultRuleSummaryConfig(ruleForm.filters, ruleForm.publication_priority, filterableColumns)
+        : [],
+    [filterableColumns, ruleForm?.filters, ruleForm?.publication_priority]
+  );
+  const activeSummaryConfig = summaryConfigCustom ? summaryConfig : defaultSummaryConfig;
+  const activeViewTitle = activeView === "portals" ? "Portais" : activeView === "rules" ? "Regras" : "Status";
+  const searchPlaceholder =
+    activeView === "portals" ? "Buscar portal" : activeView === "rules" ? "Buscar regra" : "Buscar regra ativa";
   const portalFormTotal = portalForm.ad_types.reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
   const isPortalEditing = portalMode === "edit" || !portalForm.id;
   const isRuleEditing = ruleMode === "edit" || !ruleForm?.id;
@@ -204,6 +320,53 @@ export default function Home() {
       .includes(query.toLowerCase())
   );
   const ruleTreeRows = useMemo(() => buildRuleTreeRows(visibleRules), [visibleRules]);
+  const activeRules = useMemo(() => rules.filter((rule) => rule.active), [rules]);
+  const monitoredActiveRules = useMemo(
+    () => activeRules.filter((rule) => rule.portal_id != null),
+    [activeRules]
+  );
+  const portalById = useMemo(() => new Map(portals.map((portal) => [portal.id, portal])), [portals]);
+  const visibleStatusRules = useMemo(
+    () =>
+      monitoredActiveRules.filter((rule) =>
+        `${rule.name} ${rule.description ?? ""} ${rule.portal_name ?? ""} ${rule.portal_slug ?? ""} ${rule.view_name ?? ""}`
+          .toLowerCase()
+          .includes(query.toLowerCase())
+      ),
+    [monitoredActiveRules, query]
+  );
+  const statusPortalGroups = useMemo(() => {
+    const groups = new Map<
+      number,
+      {
+        portal: Portal | null;
+        portalId: number;
+        rules: PublicationRule[];
+      }
+    >();
+
+    for (const rule of visibleStatusRules) {
+      if (rule.portal_id == null) continue;
+      const currentGroup =
+        groups.get(rule.portal_id) ??
+        {
+          portal: portalById.get(rule.portal_id) ?? null,
+          portalId: rule.portal_id,
+          rules: []
+        };
+      currentGroup.rules.push(rule);
+      groups.set(rule.portal_id, currentGroup);
+    }
+
+    return Array.from(groups.values()).sort((left, right) => {
+      const leftName = left.portal?.name ?? left.rules[0]?.portal_name ?? "";
+      const rightName = right.portal?.name ?? right.rules[0]?.portal_name ?? "";
+      return leftName.localeCompare(rightName, "pt-BR");
+    });
+  }, [portalById, visibleStatusRules]);
+  const selectedStatusRule =
+    (selectedStatusRuleId == null ? null : monitoredActiveRules.find((rule) => rule.id === selectedStatusRuleId)) ?? null;
+  const selectedStatusPortal = selectedStatusRule?.portal_id ? portalById.get(selectedStatusRule.portal_id) ?? null : null;
   const selectedPortalRules = rules.filter((rule) => rule.portal_id != null && rule.portal_id === selectedPortalId);
   const selectedRulePortal = portals.find((portal) => portal.id === ruleForm?.portal_id) ?? null;
   const ruleByViewName = useMemo(
@@ -282,6 +445,20 @@ export default function Home() {
       return currentError instanceof Error ? currentError.message : "Nao foi possivel montar a query.";
     }
   }, [currentAdLimitType, filterableColumns, ruleForm]);
+  const summaryRequestSignature = useMemo(() => {
+    if (!ruleForm) return "";
+    return JSON.stringify({
+      active: ruleForm.active,
+      include_locked: ruleForm.include_locked,
+      source_table: ruleForm.source_table,
+      portal_id: ruleForm.portal_id,
+      use_ad_limit: ruleForm.use_ad_limit,
+      ad_limit_type: currentAdLimitType,
+      filters: ruleForm.filters,
+      publication_priority: ruleForm.publication_priority,
+      items: activeSummaryConfig
+    });
+  }, [activeSummaryConfig, currentAdLimitType, ruleForm]);
 
   useEffect(() => {
     void loadAll();
@@ -294,6 +471,40 @@ export default function Home() {
   useEffect(() => {
     setViewNameCopied(false);
   }, [ruleForm?.view_name]);
+
+  useEffect(() => {
+    if (previewSortColumn === PREVIEW_RULE_ORDER_COLUMN) return;
+    if (previewRows?.columns.some((column) => column.key === previewSortColumn)) return;
+    setPreviewSortColumn(PREVIEW_RULE_ORDER_COLUMN);
+  }, [previewRows, previewSortColumn]);
+
+  useEffect(() => {
+    if (!ruleForm || !summaryRequestSignature) {
+      setRuleSummary(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      void loadRuleSummary(controller.signal);
+    }, 450);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [summaryRequestSignature]);
+
+  useEffect(() => {
+    if ((activeView !== "rules" && activeView !== "status") || !rules.length) return;
+
+    void loadRuleHealthchecks();
+    const interval = window.setInterval(() => {
+      void loadRuleHealthchecks();
+    }, HEALTHCHECK_INTERVAL_MS);
+
+    return () => window.clearInterval(interval);
+  }, [activeView, rules.length]);
 
   async function loadAll() {
     setLoading(true);
@@ -325,6 +536,9 @@ export default function Home() {
     setPreviewCount(null);
     setPreviewLimitedCount(null);
     setPreviewRows(null);
+    setRuleSummary(null);
+    setSummaryConfig([]);
+    setSummaryConfigCustom(false);
     setRuleMode("edit");
     setRuleForm({
       portal_id: portalId,
@@ -337,7 +551,8 @@ export default function Home() {
       use_ad_limit: false,
       ad_limit_type: "total",
       filters: EMPTY_FILTERS,
-      publication_priority: EMPTY_PUBLICATION_PRIORITY
+      publication_priority: EMPTY_PUBLICATION_PRIORITY,
+      summary_config: null
     });
   }
 
@@ -345,6 +560,7 @@ export default function Home() {
     setPortalForm({
       id: portal.id,
       name: portal.name,
+      slug: portal.slug,
       description: portal.description ?? "",
       logo_url: portal.logo_url ?? null,
       active: portal.active,
@@ -364,6 +580,9 @@ export default function Home() {
     setPreviewCount(null);
     setPreviewLimitedCount(null);
     setPreviewRows(null);
+    setRuleSummary(null);
+    setSummaryConfig([]);
+    setSummaryConfigCustom(false);
   }
 
   function selectPortal(portal: Portal, mode: PanelMode = "view") {
@@ -381,6 +600,11 @@ export default function Home() {
     }
   }
 
+  function openStatusView() {
+    setActiveView("status");
+    void loadRuleHealthchecks();
+  }
+
   function newRule() {
     setActiveView("rules");
     resetRuleForm(null);
@@ -394,10 +618,13 @@ export default function Home() {
   function updateRuleSource(sourceTable: string) {
     if (!ruleForm) return;
     const presetPriority = priorityFromPresetSource(sourceTable);
+    setSummaryConfigCustom(false);
+    setSummaryConfig([]);
     setRuleForm({
       ...ruleForm,
       source_table: sourceTable,
-      publication_priority: presetPriority ?? ruleForm.publication_priority
+      publication_priority: presetPriority ?? ruleForm.publication_priority,
+      summary_config: null
     });
   }
 
@@ -487,7 +714,11 @@ export default function Home() {
     setError(null);
     try {
       let savedRule: PublicationRule | null = null;
-      const payload = { ...ruleForm, ad_limit_type: ruleForm.use_ad_limit ? currentAdLimitType : null };
+      const payload = {
+        ...ruleForm,
+        ad_limit_type: ruleForm.use_ad_limit ? currentAdLimitType : null,
+        summary_config: summaryConfigCustom ? summaryConfig : null
+      };
       if (ruleForm.id) {
         const result = await fetchJson<{ rule: PublicationRule }>(`/api/rules/${ruleForm.id}`, {
           method: "PUT",
@@ -543,14 +774,22 @@ export default function Home() {
     }
   }
 
-  async function previewRuleRows() {
+  async function previewRuleRows(options: { sortColumn?: string; sortDirection?: PreviewSortDirection } = {}) {
     if (!ruleForm) return;
+    const sortColumn = options.sortColumn ?? previewSortColumn;
+    const sortDirection = options.sortDirection ?? previewSortDirection;
     setPreviewRowsLoading(true);
     setError(null);
     try {
       const result = await fetchJson<RuleRowsPreview>("/api/rules/preview/rows", {
         method: "POST",
-        body: JSON.stringify({ ...ruleForm, ad_limit_type: currentAdLimitType, limit: previewRowsLimit })
+        body: JSON.stringify({
+          ...ruleForm,
+          ad_limit_type: currentAdLimitType,
+          limit: previewRowsLimit,
+          preview_sort_column: sortColumn === PREVIEW_RULE_ORDER_COLUMN ? null : sortColumn,
+          preview_sort_direction: sortDirection
+        })
       });
       setPreviewRows(result);
     } catch (currentError) {
@@ -558,6 +797,88 @@ export default function Home() {
     } finally {
       setPreviewRowsLoading(false);
     }
+  }
+
+  async function loadRuleSummary(signal?: AbortSignal) {
+    if (!ruleForm) return;
+    setRuleSummaryLoading(true);
+    setError(null);
+    try {
+      const result = await fetchJson<RuleSummaryResponse>("/api/rules/preview/summary", {
+        method: "POST",
+        signal,
+        body: JSON.stringify({ ...ruleForm, ad_limit_type: currentAdLimitType, items: activeSummaryConfig })
+      });
+      if (!signal?.aborted) setRuleSummary(result);
+    } catch (currentError) {
+      if (signal?.aborted) return;
+      setError(currentError instanceof Error ? currentError.message : "Erro ao gerar resumo.");
+    } finally {
+      if (!signal?.aborted) setRuleSummaryLoading(false);
+    }
+  }
+
+  async function loadRuleHealthchecks(ruleId?: number) {
+    setHealthcheckLoading(true);
+    setError(null);
+    try {
+      const result = await fetchJson<{ statuses: RuleHealthcheckStatus[] }>("/api/rules/healthcheck", {
+        method: "POST",
+        body: JSON.stringify({ rule_id: ruleId ?? null })
+      });
+      const statuses = new Map(result.statuses.map((status) => [status.rule_id, status]));
+      setRules((current) =>
+        current.map((rule) => {
+          const status = statuses.get(rule.id);
+          if (!status) return rule;
+          return {
+            ...rule,
+            health_expected_count: status.expected_count,
+            health_published_count: status.published_count,
+            health_pending_count: status.pending_count,
+            health_unexpected_count: status.unexpected_count,
+            health_checked_at: status.checked_at,
+            health_error: status.error,
+            portal_slug: status.portal_slug ?? rule.portal_slug
+          };
+        })
+      );
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao executar healthcheck.");
+    } finally {
+      setHealthcheckLoading(false);
+    }
+  }
+
+  async function saveSummaryConfig(config: RuleSummaryConfigItem[], isCustom: boolean) {
+    if (!ruleForm?.id) return;
+    setError(null);
+    try {
+      const result = await fetchJson<{ rule: PublicationRule }>(`/api/rules/${ruleForm.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ summary_config: isCustom ? config : null })
+      });
+      setRuleForm((current) =>
+        current?.id === result.rule.id ? { ...current, summary_config: result.rule.summary_config } : current
+      );
+      setRules((current) =>
+        current.map((rule) =>
+          rule.id === result.rule.id ? { ...result.rule, portal_name: rule.portal_name } : rule
+        )
+      );
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao salvar configuracao do resumo.");
+    }
+  }
+
+  function updateSummaryConfig(config: RuleSummaryConfigItem[]) {
+    const isDefaultConfig = JSON.stringify(config) === JSON.stringify(defaultSummaryConfig);
+    const nextConfig = isDefaultConfig ? [] : config;
+    const isCustom = !isDefaultConfig;
+    setSummaryConfig(nextConfig);
+    setSummaryConfigCustom(isCustom);
+    setRuleForm((current) => (current ? { ...current, summary_config: isCustom ? config : null } : current));
+    void saveSummaryConfig(config, isCustom);
   }
 
   async function copyCurrentRuleQuery() {
@@ -584,9 +905,13 @@ export default function Home() {
   function editRule(rule: PublicationRule, mode: PanelMode = "view") {
     const savedPriority = rule.publication_priority ?? EMPTY_PUBLICATION_PRIORITY;
     const presetPriority = savedPriority.length ? null : priorityFromPresetSource(rule.source_table ?? "base_imoveis");
+    const savedSummaryConfig = Array.isArray(rule.summary_config) ? rule.summary_config : null;
     setPreviewCount(rule.last_count);
     setPreviewLimitedCount(rule.last_limited_count);
     setPreviewRows(null);
+    setRuleSummary(null);
+    setSummaryConfig(savedSummaryConfig ?? []);
+    setSummaryConfigCustom(savedSummaryConfig !== null);
     setRuleMode(mode);
     setRuleForm({
       id: rule.id,
@@ -600,7 +925,8 @@ export default function Home() {
       use_ad_limit: rule.use_ad_limit ?? false,
       ad_limit_type: rule.ad_limit_type ?? "total",
       filters: rule.filters ?? EMPTY_FILTERS,
-      publication_priority: savedPriority.length ? savedPriority : presetPriority ?? EMPTY_PUBLICATION_PRIORITY
+      publication_priority: savedPriority.length ? savedPriority : presetPriority ?? EMPTY_PUBLICATION_PRIORITY,
+      summary_config: savedSummaryConfig
     });
   }
 
@@ -661,15 +987,21 @@ export default function Home() {
             Regras
           </button>
         </nav>
+        <nav className="sidebar-nav sidebar-nav-bottom" aria-label="Status">
+          <button className={`nav-item ${activeView === "status" ? "selected" : ""}`} type="button" onClick={openStatusView}>
+            <MaterialIcon name="monitor_heart" size={18} />
+            Status
+          </button>
+        </nav>
       </aside>
 
       <section className="content">
         <header className="topbar">
           <div>
-            <h1>{activeView === "portals" ? "Portais" : "Regras"}</h1>
+            <h1>{activeViewTitle}</h1>
             <p>
               {metadata
-                ? `${formatNumber(portals.length)} portais - ${formatNumber(rules.length)} regras - ${formatNumber(metadata.counts.base_imoveis)} imoveis - ${formatNumber(metadata.counts.publish_locks)} locks`
+                ? `${formatNumber(portals.length)} portais - ${formatNumber(rules.length)} regras - ${formatNumber(activeRules.length)} ativas - ${formatNumber(metadata.counts.base_imoveis)} imoveis - ${formatNumber(metadata.counts.publish_locks)} locks`
                 : "Carregando metadados"}
             </p>
           </div>
@@ -679,9 +1011,10 @@ export default function Home() {
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder={activeView === "portals" ? "Buscar portal" : "Buscar regra"}
+                placeholder={searchPlaceholder}
               />
             </div>
+            {activeView !== "status" ? (
             <button
               className="secondary-button add-portal-button"
               type="button"
@@ -690,6 +1023,12 @@ export default function Home() {
               <MaterialIcon name="add" size={18} />
               {activeView === "portals" ? "Adicionar portal" : "Nova regra"}
             </button>
+            ) : (
+            <button className="secondary-button add-portal-button" type="button" onClick={() => void loadRuleHealthchecks()} disabled={healthcheckLoading}>
+              {healthcheckLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={18} />}
+              Verificar ativas
+            </button>
+            )}
             <button className="secondary-button" type="button" onClick={() => void loadAll()} disabled={loading}>
               <MaterialIcon name="refresh" size={18} />
               Atualizar
@@ -756,6 +1095,111 @@ export default function Home() {
               ))
             ) : (
               <div className="empty-state">Nenhum portal encontrado.</div>
+            )}
+          </div>
+        </section>
+        ) : activeView === "status" ? (
+        <section className="status-directory">
+          <div className="portal-directory-heading">
+            <div>
+              <h2>Regras ativas</h2>
+              <span>{formatNumber(visibleStatusRules.length)} monitoradas</span>
+            </div>
+          </div>
+
+          <div className="status-portal-groups">
+            {loading ? (
+              <div className="empty-state">
+                <Loader2 className="spin" size={18} /> Carregando
+              </div>
+            ) : statusPortalGroups.length ? (
+              statusPortalGroups.map((group) => {
+                const portalName = group.portal?.name ?? group.rules[0]?.portal_name ?? "Portal";
+                const portalSlug = group.portal?.slug ?? group.rules[0]?.portal_slug ?? "";
+                const errorCount = group.rules.filter((rule) => ruleHealthTone(rule) === "error").length;
+                const warningCount = group.rules.filter((rule) => ruleHealthTone(rule) === "warning").length;
+                const unknownCount = group.rules.filter((rule) => ruleHealthTone(rule) === "unknown").length;
+                const pendingTotal = group.rules.reduce((total, rule) => total + (rule.health_pending_count ?? 0), 0);
+                const unexpectedTotal = group.rules.reduce((total, rule) => total + (rule.health_unexpected_count ?? 0), 0);
+                const groupTone = errorCount ? "error" : warningCount ? "warning" : unknownCount ? "unknown" : "ok";
+
+                return (
+                  <section className={`status-portal-group ${groupTone}`} key={group.portalId}>
+                    <div className="status-portal-heading">
+                      <span className="portal-logo status-portal-logo">
+                        {group.portal?.logo_url ? <img src={group.portal.logo_url} alt="" /> : <Globe2 size={20} />}
+                      </span>
+                      <div className="status-portal-copy">
+                        <h3>{portalName}</h3>
+                        <span>{portalSlug || "Slug indisponivel"}</span>
+                      </div>
+                      <div className="status-portal-summary">
+                        <span>
+                          <small>Regras</small>
+                          <strong>{formatNumber(group.rules.length)}</strong>
+                        </span>
+                        <span>
+                          <small>Pendentes</small>
+                          <strong>{formatNumber(pendingTotal)}</strong>
+                        </span>
+                        <span>
+                          <small>Indevidos</small>
+                          <strong>{formatNumber(unexpectedTotal)}</strong>
+                        </span>
+                        <span>
+                          <small>Alertas</small>
+                          <strong>{formatNumber(errorCount + warningCount + unknownCount)}</strong>
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="status-rule-list status-portal-rules">
+                      {group.rules.map((rule) => (
+                        <button
+                          className={`status-rule-card ${ruleHealthTone(rule)} ${rule.id === selectedStatusRuleId ? "selected" : ""}`}
+                          key={rule.id}
+                          type="button"
+                          onClick={() => setSelectedStatusRuleId(rule.id)}
+                        >
+                          <span className="status-rule-main">
+                            <span className="portal-logo rule-node-icon">
+                              <MaterialIcon name="monitor_heart" size={18} />
+                            </span>
+                            <span>
+                              <strong>{rule.name}</strong>
+                              <small>{rule.view_name ?? "View indisponivel"}</small>
+                            </span>
+                          </span>
+                          <span className="status-rule-metrics">
+                            <span>
+                              <small>Esperados</small>
+                              <strong>{rule.health_expected_count == null ? "-" : formatNumber(rule.health_expected_count)}</strong>
+                            </span>
+                            <span>
+                              <small>Publicados</small>
+                              <strong>{rule.health_published_count == null ? "-" : formatNumber(rule.health_published_count)}</strong>
+                            </span>
+                            <span>
+                              <small>Pendentes</small>
+                              <strong>{rule.health_pending_count == null ? "-" : formatNumber(rule.health_pending_count)}</strong>
+                            </span>
+                            <span>
+                              <small>Indevidos</small>
+                              <strong>{rule.health_unexpected_count == null ? "-" : formatNumber(rule.health_unexpected_count)}</strong>
+                            </span>
+                          </span>
+                          <span className={`healthcheck-badge ${ruleHealthTone(rule)}`}>
+                            {statusLabel(rule)}
+                          </span>
+                          {rule.health_error && <span className="status-rule-error">{rule.health_error}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                );
+              })
+            ) : (
+              <div className="empty-state">Nenhuma regra ativa com portal vinculado encontrada.</div>
             )}
           </div>
         </section>
@@ -836,7 +1280,7 @@ export default function Home() {
             <MaterialIcon name={detailsPanelCollapsed ? "keyboard_double_arrow_left" : "keyboard_double_arrow_right"} size={19} />
           </button>
           {!detailsPanelCollapsed && (
-            <span>{activeView === "portals" ? "Detalhes do portal" : "Detalhes da regra"}</span>
+            <span>{activeView === "portals" ? "Detalhes do portal" : activeView === "status" ? "Status" : "Detalhes da regra"}</span>
           )}
         </div>
         {!detailsPanelCollapsed && (activeView === "portals" ? (
@@ -883,6 +1327,26 @@ export default function Home() {
                 />
                 ) : (
                   <span className="view-field">{displayValue(portalForm.name)}</span>
+                )}
+              </label>
+              <label>
+                <span className="field-label-with-help">
+                  Slug
+                  <span className="field-help-icon" title={PORTAL_SLUG_HELP} aria-label={PORTAL_SLUG_HELP}>
+                    <MaterialIcon name="info" size={15} />
+                  </span>
+                </span>
+                {isPortalEditing ? (
+                <input
+                  value={portalForm.slug}
+                  pattern="[a-z0-9_]+"
+                  placeholder="grupo_zap"
+                  title="Use apenas letras minusculas, numeros e underscore."
+                  onChange={(event) => setPortalForm({ ...portalForm, slug: event.target.value })}
+                  required
+                />
+                ) : (
+                  <span className="view-field code-view-field portal-slug-view">{displayValue(portalForm.slug)}</span>
                 )}
               </label>
               <label>
@@ -999,6 +1463,111 @@ export default function Home() {
           )}
         </form>
 
+        ) : activeView === "status" ? (
+          <section className="status-side-panel">
+            <div className="panel-heading inset">
+              <div>
+                <h2>{selectedStatusRule ? selectedStatusRule.name : "Status"}</h2>
+                <span>
+                  {selectedStatusRule
+                    ? `${selectedStatusPortal?.name ?? selectedStatusRule.portal_name ?? "Portal"} - ${statusLabel(selectedStatusRule)}`
+                    : `${formatNumber(monitoredActiveRules.length)} monitoradas`}
+                </span>
+              </div>
+              <div className="panel-heading-actions">
+                {selectedStatusRule && (
+                  <button
+                    className="secondary-button compact-button"
+                    type="button"
+                    onClick={() => {
+                      setActiveView("rules");
+                      editRule(selectedStatusRule, "view");
+                    }}
+                  >
+                    <MaterialIcon name="open_in_new" size={17} />
+                    Regra
+                  </button>
+                )}
+                <button className="secondary-button compact-button" type="button" onClick={() => void loadRuleHealthchecks(selectedStatusRule?.id)} disabled={healthcheckLoading}>
+                  {healthcheckLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={17} />}
+                  Verificar
+                </button>
+              </div>
+            </div>
+            {selectedStatusRule ? (
+              <>
+                <div className="status-detail-card">
+                  <div className="status-detail-title">
+                    <span className={`healthcheck-badge ${ruleHealthTone(selectedStatusRule)}`}>{statusLabel(selectedStatusRule)}</span>
+                    <span>{formatTimestamp(selectedStatusRule.health_checked_at)}</span>
+                  </div>
+                  <div className="healthcheck-grid status-detail-grid">
+                    <div>
+                      <span>Esperados</span>
+                      <strong>{selectedStatusRule.health_expected_count == null ? "-" : formatNumber(selectedStatusRule.health_expected_count)}</strong>
+                    </div>
+                    <div>
+                      <span>Publicados</span>
+                      <strong>{selectedStatusRule.health_published_count == null ? "-" : formatNumber(selectedStatusRule.health_published_count)}</strong>
+                    </div>
+                    <div className={(selectedStatusRule.health_pending_count ?? 0) > 0 ? "warning" : "ok"}>
+                      <span>Pendentes</span>
+                      <strong>{selectedStatusRule.health_pending_count == null ? "-" : formatNumber(selectedStatusRule.health_pending_count)}</strong>
+                    </div>
+                    <div className={(selectedStatusRule.health_unexpected_count ?? 0) > 0 ? "warning" : "ok"}>
+                      <span>Indevidos</span>
+                      <strong>{selectedStatusRule.health_unexpected_count == null ? "-" : formatNumber(selectedStatusRule.health_unexpected_count)}</strong>
+                    </div>
+                    <div>
+                      <span>Tipo</span>
+                      <strong>{selectedStatusRule.use_ad_limit ? selectedStatusRule.ad_limit_type ?? "total" : "total"}</strong>
+                    </div>
+                  </div>
+                  {selectedStatusRule.health_error && <div className="healthcheck-message error">{selectedStatusRule.health_error}</div>}
+                </div>
+
+                <div className="status-query-card">
+                  <div className="status-query-heading">
+                    <span>Query de publicados</span>
+                    <strong>{selectedStatusRule.view_name ?? "View indisponivel"}</strong>
+                  </div>
+                  <pre>{buildStatusPublishedQuery(selectedStatusRule)}</pre>
+                </div>
+
+                <div className="status-query-card">
+                  <div className="status-query-heading">
+                    <span>Query de publicados indevidos</span>
+                    <strong>imoveis_ativos fora da regra</strong>
+                  </div>
+                  <pre>{buildStatusUnexpectedQuery(selectedStatusRule)}</pre>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="healthcheck-grid status-summary-grid">
+                  <div className="ok">
+                    <span>OK</span>
+                    <strong>{formatNumber(monitoredActiveRules.filter((rule) => ruleHealthTone(rule) === "ok").length)}</strong>
+                  </div>
+                  <div className="warning">
+                    <span>Divergentes</span>
+                    <strong>{formatNumber(monitoredActiveRules.filter((rule) => ruleHealthTone(rule) === "warning").length)}</strong>
+                  </div>
+                  <div className="error">
+                    <span>Com erro</span>
+                    <strong>{formatNumber(monitoredActiveRules.filter((rule) => ruleHealthTone(rule) === "error").length)}</strong>
+                  </div>
+                  <div className="unknown">
+                    <span>Pendentes</span>
+                    <strong>{formatNumber(monitoredActiveRules.filter((rule) => ruleHealthTone(rule) === "unknown").length)}</strong>
+                  </div>
+                </div>
+                <div className="healthcheck-message ok">
+                  Verificacao automatica a cada {formatNumber(HEALTHCHECK_INTERVAL_MINUTES)} min.
+                </div>
+              </>
+            )}
+          </section>
         ) : ruleForm ? (
             <form className={`rule-form ${isRuleEditing ? "edit-mode" : "view-mode"}`} onSubmit={saveRule}>
               <div className="panel-heading inset">
@@ -1301,6 +1870,16 @@ export default function Home() {
                 )}
               </div>
 
+              <RuleSummarySection
+                columns={filterableColumns}
+                config={activeSummaryConfig}
+                defaultConfig={defaultSummaryConfig}
+                data={ruleSummary}
+                loading={ruleSummaryLoading}
+                onConfigChange={updateSummaryConfig}
+                onRefresh={() => void loadRuleSummary()}
+              />
+
               <section className="preview-rows-card">
                 <div className="preview-rows-heading">
                   <div>
@@ -1312,6 +1891,43 @@ export default function Home() {
                     </span>
                   </div>
                   <div className="preview-rows-actions">
+                    <div className="preview-sort-controls">
+                      <label className="preview-sort-select-wrap">
+                        <ListOrdered size={15} />
+                        <select
+                          aria-label="Coluna para ordenar a pre visualizacao"
+                          value={previewSortColumn}
+                          onChange={(event) => {
+                            const sortColumn = event.target.value;
+                            setPreviewSortColumn(sortColumn);
+                            if (previewRows) void previewRuleRows({ sortColumn });
+                          }}
+                          disabled={!previewRows?.columns.length}
+                        >
+                          <option value={PREVIEW_RULE_ORDER_COLUMN}>Ordem da regra</option>
+                          {previewRows?.columns.map((column) => (
+                            <option key={column.key} value={column.key}>
+                              {column.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        className={`preview-sort-direction ${previewSortDirection}`}
+                        type="button"
+                        aria-label={`Ordenar em ordem ${previewSortDirection === "asc" ? "crescente" : "decrescente"}`}
+                        title={`Ordem ${previewSortDirection === "asc" ? "crescente" : "decrescente"}`}
+                        disabled={previewRowsLoading}
+                        onClick={() => {
+                          const sortDirection = previewSortDirection === "asc" ? "desc" : "asc";
+                          setPreviewSortDirection(sortDirection);
+                          if (previewRows) void previewRuleRows({ sortDirection });
+                        }}
+                      >
+                        {previewSortDirection === "asc" ? <ArrowUpAZ size={16} /> : <ArrowDownAZ size={16} />}
+                        <span>{previewSortDirection === "asc" ? "Asc" : "Desc"}</span>
+                      </button>
+                    </div>
                     <div className="segmented preview-limit-toggle" aria-label="Quantidade de linhas">
                       <button
                         className={previewRowsLimit === 10 ? "selected" : ""}

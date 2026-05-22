@@ -1,4 +1,4 @@
-import type { ColumnMetadata, Portal, PortalAdType, PublicationPriority, RuleFilters, SourceViewMetadata } from "@/lib/types";
+import type { ColumnMetadata, Portal, PortalAdType, PublicationPriority, RuleFilters, RuleSummaryConfigItem, SourceViewMetadata } from "@/lib/types";
 
 export type MetadataResponse = {
   columns: ColumnMetadata[];
@@ -6,7 +6,7 @@ export type MetadataResponse = {
   source_views: SourceViewMetadata[];
 };
 
-export type PortalForm = Pick<Portal, "name" | "description" | "logo_url" | "active"> & {
+export type PortalForm = Pick<Portal, "name" | "slug" | "description" | "logo_url" | "active"> & {
   id?: number;
   ad_types: Array<Pick<PortalAdType, "name" | "quantity">>;
 };
@@ -24,11 +24,12 @@ export type RuleForm = {
   ad_limit_type: string | null;
   filters: RuleFilters;
   publication_priority: PublicationPriority;
+  summary_config?: RuleSummaryConfigItem[] | null;
 };
 
-export type ActiveView = "portals" | "rules";
+export type ActiveView = "portals" | "rules" | "status";
 export type PanelMode = "view" | "edit";
 
-export const EMPTY_PORTAL: PortalForm = { name: "", description: "", logo_url: null, active: true, ad_types: [] };
+export const EMPTY_PORTAL: PortalForm = { name: "", slug: "", description: "", logo_url: null, active: true, ad_types: [] };
 export const EMPTY_FILTERS: RuleFilters = { combinator: "and", conditions: [] };
 export const EMPTY_PUBLICATION_PRIORITY: PublicationPriority = [];

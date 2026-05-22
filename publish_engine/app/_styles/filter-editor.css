@@ -639,12 +639,13 @@ code,
 }
 
 .priority-list {
+  align-items: start;
   display: grid;
   gap: 8px;
 }
 
 .priority-row {
-  align-items: center;
+  align-items: start;
   display: grid;
   gap: 8px;
   grid-template-columns: 32px minmax(170px, 1fr) auto minmax(134px, 0.42fr);

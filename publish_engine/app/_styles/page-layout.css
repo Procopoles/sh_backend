@@ -63,6 +63,10 @@
   gap: 8px;
 }
 
+.sidebar-nav-bottom {
+  margin-top: auto;
+}
+
 .nav-item {
   align-items: center;
   background: rgba(255, 255, 255, 0.045);
