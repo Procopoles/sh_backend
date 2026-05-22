@@ -126,7 +126,7 @@ export async function createPortal(input: PortalInput) {
   if (isDataApiConfigured()) return createPortalViaApi(input);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  const portal = await withTransaction(async (client) => {
     const slug = normalizePortalSlug(input.slug, input.name);
     const result = await client.query<Portal>(
       `
@@ -139,14 +139,18 @@ export async function createPortal(input: PortalInput) {
     await replacePortalAdTypes(client, result.rows[0].id, input.ad_types ?? []);
     return getPortalById(client, result.rows[0].id);
   });
+  invalidateHealthcheckReportCache();
+  return portal;
 }
 
 export async function updatePortal(id: number, input: PortalInput) {
   if (isDataApiConfigured()) return updatePortalViaApi(id, input);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  const portal = await withTransaction(async (client) => {
     const slug = normalizePortalSlug(input.slug, input.name);
+    const currentAdTypes = await listPortalAdTypes(client, id);
+    const adTypesChanged = portalAdTypesSignature(currentAdTypes) !== portalAdTypesSignature(input.ad_types ?? []);
     const result = await client.query<Portal>(
       `
         update publish_portals
@@ -158,18 +162,24 @@ export async function updatePortal(id: number, input: PortalInput) {
     );
     if (!result.rows[0]) return null;
     await replacePortalAdTypes(client, id, input.ad_types ?? []);
+    if (adTypesChanged) {
+      await refreshRuleViewsForPortal(client, id);
+    }
     return getPortalById(client, id);
   });
+  invalidateHealthcheckReportCache();
+  return portal;
 }
 
 export async function deletePortal(id: number) {
   if (isDataApiConfigured()) return deletePortalViaApi(id);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  await withTransaction(async (client) => {
     await client.query("update publish_rules set portal_id = null, updated_at = now() where portal_id = $1", [id]);
     await client.query("delete from publish_portals where id = $1", [id]);
   });
+  invalidateHealthcheckReportCache();
 }
 
 export async function listRules(portalId?: number) {
@@ -179,7 +189,7 @@ export async function listRules(portalId?: number) {
   const params = portalId ? [portalId] : [];
   const result = await query<PublicationRule>(
     `
-      select r.*, p.name as portal_name, p.slug as portal_slug
+      select r.*, p.name as portal_name, p.slug as portal_slug, p.logo_url as portal_logo_url
       from publish_rules r
       left join publish_portals p on p.id = r.portal_id
       ${portalId ? "where r.portal_id = $1" : ""}
@@ -194,7 +204,7 @@ export async function createRule(input: RuleInput) {
   if (isDataApiConfigured()) return createRuleViaApi(input);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  const rule = await withTransaction(async (client) => {
     const columns = await getBaseColumns(client);
     const portalId = normalizePortalId(input.portal_id);
     const portal = portalId
@@ -246,13 +256,15 @@ export async function createRule(input: RuleInput) {
       summary_config: summaryConfig
     });
   });
+  invalidateHealthcheckReportCache();
+  return rule;
 }
 
 export async function updateRule(id: number, input: RuleInput) {
   if (isDataApiConfigured()) return updateRuleViaApi(id, input);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  const rule = await withTransaction(async (client) => {
     const columns = await getBaseColumns(client);
     const existing = await client.query<PublicationRule>("select * from publish_rules where id = $1", [id]);
     if (!existing.rows[0]) return null;
@@ -315,7 +327,7 @@ export async function updateRule(id: number, input: RuleInput) {
       ]
     );
 
-    return refreshRuleView(client, id, updated.rows[0].view_name, {
+    const refreshed = await refreshRuleView(client, id, updated.rows[0].view_name, {
       ...updated.rows[0],
       filters,
       source_table: sourceTable,
@@ -326,14 +338,18 @@ export async function updateRule(id: number, input: RuleInput) {
       publication_priority: publicationPriority,
       summary_config: summaryConfig
     });
+    await refreshDependentRuleViews(client, refreshed.view_name, new Set([id]));
+    return refreshed;
   });
+  invalidateHealthcheckReportCache();
+  return rule;
 }
 
 export async function updateRuleSummaryConfig(id: number, summaryConfigInput: unknown) {
   if (isDataApiConfigured()) return updateRuleSummaryConfigViaApi(id, summaryConfigInput);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  const rule = await withTransaction(async (client) => {
     const columns = await getBaseColumns(client);
     const summaryConfig = sanitizeRuleSummaryConfig(summaryConfigInput, columns);
     const result = await client.query<PublicationRule>(
@@ -348,13 +364,15 @@ export async function updateRuleSummaryConfig(id: number, summaryConfigInput: un
     );
     return result.rows[0] ?? null;
   });
+  invalidateHealthcheckReportCache();
+  return rule;
 }
 
 export async function deleteRule(id: number) {
   if (isDataApiConfigured()) return deleteRuleViaApi(id);
 
   await ensureControlSchema();
-  return withTransaction(async (client) => {
+  await withTransaction(async (client) => {
     const existing = await client.query<{ view_name: string | null }>(
       "select view_name from publish_rules where id = $1",
       [id]
@@ -364,10 +382,15 @@ export async function deleteRule(id: number) {
     }
     await client.query("delete from publish_rules where id = $1", [id]);
   });
+  invalidateHealthcheckReportCache();
 }
 
 export async function runRuleHealthchecks(ruleId?: number | null): Promise<RuleHealthcheckStatus[]> {
-  if (isDataApiConfigured()) return runRuleHealthchecksViaApi(ruleId);
+  if (isDataApiConfigured()) {
+    const statuses = await runRuleHealthchecksViaApi(ruleId);
+    invalidateHealthcheckReportCache(ruleId);
+    return statuses;
+  }
 
   await ensureControlSchema();
   const result = await query<
@@ -390,6 +413,7 @@ export async function runRuleHealthchecks(ruleId?: number | null): Promise<RuleH
   for (const rule of result.rows) {
     statuses.push(await runSingleRuleHealthcheck(rule));
   }
+  invalidateHealthcheckReportCache(ruleId);
   return statuses;
 }
 
@@ -1032,11 +1056,15 @@ async function createPortalViaApi(input: PortalInput) {
     }
   });
   await replacePortalAdTypesViaApi(rows[0].id, input.ad_types ?? []);
-  return getPortalByIdViaApi(rows[0].id);
+  const portal = await getPortalByIdViaApi(rows[0].id);
+  invalidateHealthcheckReportCache();
+  return portal;
 }
 
 async function updatePortalViaApi(id: number, input: PortalInput) {
   const slug = normalizePortalSlug(input.slug, input.name);
+  const currentAdTypes = await dataApiRequest<PortalAdType[]>(`/publish_portal_ad_types?portal_id=eq.${id}&order=name.asc`);
+  const adTypesChanged = portalAdTypesSignature(currentAdTypes) !== portalAdTypesSignature(input.ad_types ?? []);
   const rows = await dataApiRequest<Portal[]>(`/publish_portals?id=eq.${id}`, {
     method: "PATCH",
     prefer: "return=representation",
@@ -1051,12 +1079,18 @@ async function updatePortalViaApi(id: number, input: PortalInput) {
   });
   if (!rows[0]) return null;
   await replacePortalAdTypesViaApi(id, input.ad_types ?? []);
-  return getPortalByIdViaApi(id);
+  if (adTypesChanged) {
+    await refreshRuleViewsForPortalViaApi(id);
+  }
+  const portal = await getPortalByIdViaApi(id);
+  invalidateHealthcheckReportCache();
+  return portal;
 }
 
 async function deletePortalViaApi(id: number) {
   await dataApiRequest(`/publish_rules?portal_id=eq.${id}`, { method: "PATCH", body: { portal_id: null } });
   await dataApiRequest(`/publish_portals?id=eq.${id}`, { method: "DELETE" });
+  invalidateHealthcheckReportCache();
 }
 
 async function listRulesViaApi(portalId?: number) {
@@ -1065,14 +1099,16 @@ async function listRulesViaApi(portalId?: number) {
     : "/publish_rules?order=updated_at.desc,id.desc";
   const [rules, portals] = await Promise.all([
     dataApiRequest<PublicationRule[]>(rulePath),
-    dataApiRequest<Array<Pick<Portal, "id" | "name" | "slug">>>("/publish_portals?select=id,name,slug")
+    dataApiRequest<Array<Pick<Portal, "id" | "name" | "slug" | "logo_url">>>("/publish_portals?select=id,name,slug,logo_url")
   ]);
   const portalNames = new Map(portals.map((portal) => [portal.id, portal.name]));
   const portalSlugs = new Map(portals.map((portal) => [portal.id, portal.slug]));
+  const portalLogos = new Map(portals.map((portal) => [portal.id, portal.logo_url]));
   return rules.map((rule) => ({
     ...rule,
     portal_name: rule.portal_id == null ? undefined : portalNames.get(rule.portal_id),
-    portal_slug: rule.portal_id == null ? undefined : portalSlugs.get(rule.portal_id)
+    portal_slug: rule.portal_id == null ? undefined : portalSlugs.get(rule.portal_id),
+    portal_logo_url: rule.portal_id == null ? undefined : portalLogos.get(rule.portal_id)
   }));
 }
 
@@ -1107,6 +1143,7 @@ async function createRuleViaApi(input: RuleInput) {
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", {
     rule_id: inserted[0].id
   });
+  invalidateHealthcheckReportCache();
   return refreshed[0];
 }
 
@@ -1154,6 +1191,8 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
 
   if (!updated[0]) return null;
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", { rule_id: id });
+  await refreshDependentRuleViewsViaApi(refreshed[0]?.view_name ?? null, new Set([id]));
+  invalidateHealthcheckReportCache();
   return refreshed[0];
 }
 
@@ -1168,12 +1207,14 @@ async function updateRuleSummaryConfigViaApi(id: number, summaryConfigInput: unk
       updated_at: new Date().toISOString()
     }
   });
+  invalidateHealthcheckReportCache();
   return updated[0] ?? null;
 }
 
 async function deleteRuleViaApi(id: number) {
   await dataApiRpc<PublicationRule[]>("drop_publish_rule_view", { rule_id: id });
   await dataApiRequest(`/publish_rules?id=eq.${id}`, { method: "DELETE" });
+  invalidateHealthcheckReportCache();
 }
 
 async function runRuleHealthchecksViaApi(ruleId?: number | null) {
@@ -1282,6 +1323,175 @@ async function listBaseColumnsViaApi() {
   const columns = await dataApiRpc<ColumnMetadata[]>("publish_base_columns");
   dataApiColumnsCache = { columns, expiresAt: Date.now() + DATA_API_COLUMNS_CACHE_MS };
   return columns;
+}
+
+async function listPortalAdTypes(client: PoolClient, portalId: number) {
+  const result = await client.query<PortalAdType>(
+    "select id, portal_id, name, quantity, created_at, updated_at from publish_portal_ad_types where portal_id = $1 order by name",
+    [portalId]
+  );
+  return result.rows;
+}
+
+function portalAdTypesSignature(adTypes: PortalAdTypeInput[] | PortalAdType[]) {
+  return JSON.stringify(sanitizeAdTypes(adTypes).sort((left, right) => left.name.localeCompare(right.name, "pt-BR")));
+}
+
+async function refreshRuleViewsForPortal(client: PoolClient, portalId: number) {
+  const rules = await listRefreshableRules(client);
+  const seedIds = rules.filter((rule) => rule.portal_id === portalId).map((rule) => rule.id);
+  await refreshRuleViewsBySeedIds(client, seedIds, rules);
+}
+
+async function refreshDependentRuleViews(client: PoolClient, sourceViewName: string | null, ignoredIds = new Set<number>()) {
+  if (!sourceViewName) return;
+  const rules = await listRefreshableRules(client);
+  const seedIds = rules
+    .filter((rule) => rule.source_table === sourceViewName && !ignoredIds.has(rule.id))
+    .map((rule) => rule.id);
+  await refreshRuleViewsBySeedIds(client, seedIds, rules);
+}
+
+async function listRefreshableRules(client: PoolClient) {
+  const result = await client.query<PublicationRule>("select * from publish_rules order by id asc");
+  return result.rows;
+}
+
+async function refreshRuleViewsBySeedIds(client: PoolClient, seedIds: number[], rules: PublicationRule[]) {
+  if (!seedIds.length) return;
+
+  const rulesById = new Map(rules.map((rule) => [rule.id, rule]));
+  const viewToRuleId = new Map<string, number>();
+  for (const rule of rules) {
+    if (rule.view_name) viewToRuleId.set(rule.view_name, rule.id);
+  }
+
+  const pending = new Set<number>();
+  const queue = [...seedIds];
+  while (queue.length) {
+    const ruleId = queue.shift();
+    if (!ruleId || pending.has(ruleId)) continue;
+    const rule = rulesById.get(ruleId);
+    if (!rule) continue;
+    pending.add(ruleId);
+
+    if (!rule.view_name) continue;
+    for (const child of rules) {
+      if (child.source_table === rule.view_name && !pending.has(child.id)) {
+        queue.push(child.id);
+      }
+    }
+  }
+
+  while (pending.size) {
+    let progressed = false;
+    for (const ruleId of [...pending]) {
+      const rule = rulesById.get(ruleId);
+      if (!rule) {
+        pending.delete(ruleId);
+        continue;
+      }
+
+      const parentRuleId = rule.source_table ? viewToRuleId.get(rule.source_table) : undefined;
+      if (parentRuleId && pending.has(parentRuleId)) continue;
+
+      const refreshed = await refreshRuleView(client, rule.id, rule.view_name, rule);
+      rulesById.set(rule.id, { ...rule, ...refreshed });
+      if (refreshed.view_name) viewToRuleId.set(refreshed.view_name, refreshed.id);
+      pending.delete(ruleId);
+      progressed = true;
+    }
+
+    if (!progressed) {
+      const [ruleId] = pending;
+      const rule = rulesById.get(ruleId);
+      pending.delete(ruleId);
+      if (rule) {
+        const refreshed = await refreshRuleView(client, rule.id, rule.view_name, rule);
+        rulesById.set(rule.id, { ...rule, ...refreshed });
+        if (refreshed.view_name) viewToRuleId.set(refreshed.view_name, refreshed.id);
+      }
+    }
+  }
+}
+
+async function refreshRuleViewsForPortalViaApi(portalId: number) {
+  const rules = await dataApiRequest<PublicationRule[]>("/publish_rules?order=id.asc");
+  const seedIds = rules.filter((rule) => rule.portal_id === portalId).map((rule) => rule.id);
+  await refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
+}
+
+async function refreshDependentRuleViewsViaApi(sourceViewName: string | null, ignoredIds = new Set<number>()) {
+  if (!sourceViewName) return;
+  const rules = await dataApiRequest<PublicationRule[]>("/publish_rules?order=id.asc");
+  const seedIds = rules
+    .filter((rule) => rule.source_table === sourceViewName && !ignoredIds.has(rule.id))
+    .map((rule) => rule.id);
+  await refreshRuleViewsBySeedIdsViaApi(seedIds, rules);
+}
+
+async function refreshRuleViewsBySeedIdsViaApi(seedIds: number[], rules: PublicationRule[]) {
+  if (!seedIds.length) return;
+
+  const rulesById = new Map(rules.map((rule) => [rule.id, rule]));
+  const viewToRuleId = new Map<string, number>();
+  for (const rule of rules) {
+    if (rule.view_name) viewToRuleId.set(rule.view_name, rule.id);
+  }
+
+  const pending = new Set<number>();
+  const queue = [...seedIds];
+  while (queue.length) {
+    const ruleId = queue.shift();
+    if (!ruleId || pending.has(ruleId)) continue;
+    const rule = rulesById.get(ruleId);
+    if (!rule) continue;
+    pending.add(ruleId);
+
+    if (!rule.view_name) continue;
+    for (const child of rules) {
+      if (child.source_table === rule.view_name && !pending.has(child.id)) {
+        queue.push(child.id);
+      }
+    }
+  }
+
+  while (pending.size) {
+    let progressed = false;
+    for (const ruleId of [...pending]) {
+      const rule = rulesById.get(ruleId);
+      if (!rule) {
+        pending.delete(ruleId);
+        continue;
+      }
+
+      const parentRuleId = rule.source_table ? viewToRuleId.get(rule.source_table) : undefined;
+      if (parentRuleId && pending.has(parentRuleId)) continue;
+
+      const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", { rule_id: rule.id });
+      const refreshedRule = refreshed[0];
+      if (refreshedRule) {
+        rulesById.set(rule.id, { ...rule, ...refreshedRule });
+        if (refreshedRule.view_name) viewToRuleId.set(refreshedRule.view_name, refreshedRule.id);
+      }
+      pending.delete(ruleId);
+      progressed = true;
+    }
+
+    if (!progressed) {
+      const [ruleId] = pending;
+      pending.delete(ruleId);
+      const rule = rulesById.get(ruleId);
+      if (rule) {
+        const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", { rule_id: rule.id });
+        const refreshedRule = refreshed[0];
+        if (refreshedRule) {
+          rulesById.set(rule.id, { ...rule, ...refreshedRule });
+          if (refreshedRule.view_name) viewToRuleId.set(refreshedRule.view_name, refreshedRule.id);
+        }
+      }
+    }
+  }
 }
 
 async function assertPortalExistsViaApi(portalId: number) {
@@ -1596,6 +1806,20 @@ function healthcheckReportRuleCacheKey(rule: HealthcheckReportRuleRow) {
     rule.health_checked_at ?? "",
     rule.updated_at ?? ""
   ].join("|");
+}
+
+function invalidateHealthcheckReportCache(ruleId?: number | null) {
+  dataApiHealthcheckReportCache = null;
+
+  if (!ruleId) {
+    healthcheckReportRuleCache.clear();
+    return;
+  }
+
+  const keyPrefix = `${ruleId}|`;
+  for (const key of healthcheckReportRuleCache.keys()) {
+    if (key.startsWith(keyPrefix)) healthcheckReportRuleCache.delete(key);
+  }
 }
 
 function trimHealthcheckReportRuleCache() {

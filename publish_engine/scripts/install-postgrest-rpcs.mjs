@@ -947,6 +947,7 @@ end
 $$;
 
 drop function if exists public.preview_publish_rule_summary(jsonb, boolean, boolean, text, jsonb, integer, boolean, text, jsonb);
+drop function if exists public.preview_publish_rule_summary(jsonb);
 
 create or replace function public.preview_publish_rule_summary(
   filters jsonb,
@@ -1319,7 +1320,28 @@ begin
 end
 $$;
 
+create or replace function public.preview_publish_rule_summary(jsonb)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_catalog
+as $$
+  select public.preview_publish_rule_summary(
+    coalesce($1 -> 'filters', '[]'::jsonb),
+    coalesce(($1 ->> 'include_locked')::boolean, true),
+    coalesce(($1 ->> 'active')::boolean, true),
+    coalesce(nullif($1 ->> 'source_table', ''), 'base_imoveis'),
+    coalesce($1 -> 'publication_priority', '[]'::jsonb),
+    nullif($1 ->> 'portal_id', '')::integer,
+    coalesce(($1 ->> 'use_ad_limit')::boolean, false),
+    coalesce(nullif($1 ->> 'ad_limit_type', ''), 'total'),
+    coalesce($1 -> 'items', '[]'::jsonb)
+  )
+$$;
+
 drop function if exists public.publish_rule_healthcheck(integer);
+drop function if exists public.publish_rule_healthcheck(jsonb);
 
 create or replace function public.publish_rule_healthcheck(target_rule_id integer default null)
 returns table (
@@ -1487,7 +1509,28 @@ begin
 end
 $$;
 
+create or replace function public.publish_rule_healthcheck(jsonb)
+returns table (
+  rule_id integer,
+  portal_id integer,
+  portal_slug text,
+  expected_count integer,
+  published_count integer,
+  pending_count integer,
+  unexpected_count integer,
+  checked_at timestamptz,
+  error text
+)
+language sql
+security definer
+set search_path = public, pg_catalog
+as $$
+  select *
+  from public.publish_rule_healthcheck(nullif($1 ->> 'target_rule_id', '')::integer)
+$$;
+
 drop function if exists public.publish_rule_healthcheck_report(integer);
+drop function if exists public.publish_rule_healthcheck_report(jsonb);
 
 create or replace function public.publish_rule_healthcheck_report(target_rule_id integer default null)
 returns jsonb
@@ -1779,6 +1822,15 @@ begin
 end
 $$;
 
+create or replace function public.publish_rule_healthcheck_report(jsonb)
+returns jsonb
+language sql
+security definer
+set search_path = public, pg_catalog
+as $$
+  select public.publish_rule_healthcheck_report(nullif($1 ->> 'target_rule_id', '')::integer)
+$$;
+
 grant execute on function public.publish_filter_kind(text) to service_role;
 grant execute on function public.publish_base_columns() to service_role;
 grant execute on function public.publish_control_counts() to service_role;
@@ -1791,8 +1843,11 @@ grant execute on function public.publish_order_by_sql(jsonb) to service_role;
 grant execute on function public.preview_publish_rule(jsonb, boolean, boolean, text, integer, boolean, text) to service_role;
 grant execute on function public.preview_publish_rule_rows(jsonb, boolean, boolean, text, jsonb, integer, integer, boolean, text, text, text) to service_role;
 grant execute on function public.preview_publish_rule_summary(jsonb, boolean, boolean, text, jsonb, integer, boolean, text, jsonb) to service_role;
+grant execute on function public.preview_publish_rule_summary(jsonb) to service_role;
 grant execute on function public.publish_rule_healthcheck(integer) to service_role;
+grant execute on function public.publish_rule_healthcheck(jsonb) to service_role;
 grant execute on function public.publish_rule_healthcheck_report(integer) to service_role;
+grant execute on function public.publish_rule_healthcheck_report(jsonb) to service_role;
 grant execute on function public.refresh_publish_rule_view(integer) to service_role;
 grant execute on function public.drop_publish_rule_view(integer) to service_role;
 

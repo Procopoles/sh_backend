@@ -591,3 +591,556 @@
   min-height: 120px;
   padding: 20px 22px;
 }
+
+.rule-editor-heading-copy {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.rule-editor-heading-copy > span:last-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.rule-editor-logo {
+  background: rgba(255, 255, 255, 0.055);
+  border-color: var(--line-strong);
+  height: 46px;
+  width: 46px;
+}
+
+.rule-editor-stage {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.rule-editor-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.rule-editor-panel-title {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.rule-editor-panel-title span {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.rule-edit-fullscreen {
+  --rule-accent: #3d444d;
+  --rule-card-bg: #15171c;
+  --rule-card-bg-raised: #191c22;
+  --rule-card-border: rgba(255, 255, 255, 0.12);
+  --rule-field-bg: rgba(255, 255, 255, 0.045);
+  --rule-field-border: rgba(255, 255, 255, 0.1);
+  background: linear-gradient(180deg, #121317 0%, #0d0e10 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+  display: grid;
+  gap: 22px 28px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(390px, 0.96fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  margin: 18px;
+  min-height: calc(100vh - 36px);
+  overflow: visible;
+  padding: 18px 22px 22px;
+}
+
+.rule-edit-fullscreen .rule-editor-heading {
+  border-bottom: 0;
+  grid-column: 1 / -1;
+  grid-row: 1;
+  margin: 0;
+  min-height: 48px;
+  padding: 0 6px;
+}
+
+.rule-edit-fullscreen .rule-editor-heading h2 {
+  color: #d8d8dc;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.rule-edit-fullscreen .rule-editor-heading-copy > span:last-child > span {
+  color: #9da3aa;
+  font-size: 13px;
+}
+
+.rule-edit-fullscreen .rule-editor-logo {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
+  height: 44px;
+  width: 44px;
+}
+
+.rule-config-band {
+  display: grid;
+  gap: 14px;
+}
+
+.rule-config-card {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.rule-config-card-heading {
+  display: none;
+}
+
+.rule-edit-fullscreen .rule-config-band {
+  align-items: stretch;
+  display: grid;
+  grid-column: 1 / 3;
+  grid-row: 2;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.85fr);
+  padding: 0;
+}
+
+.rule-edit-fullscreen .rule-config-card {
+  align-content: start;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
+    var(--rule-card-bg);
+  border: 1px solid var(--rule-card-border);
+  border-radius: 14px;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.18);
+  min-height: 0;
+  padding: 14px 16px;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card {
+  border-left: 3px solid rgba(53, 189, 147, 0.55);
+}
+
+.rule-edit-fullscreen .rule-config-card-heading {
+  align-items: baseline;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.rule-edit-fullscreen .rule-config-card-heading span {
+  color: #d8d8dc;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.rule-edit-fullscreen .rule-config-card-heading small {
+  color: rgba(244, 247, 248, 0.5);
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rule-edit-fullscreen .rule-config-main-card .rule-details-grid {
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.rule-edit-fullscreen .rule-config-main-card .rule-details-grid label:nth-child(3) {
+  grid-column: 1 / span 2;
+  grid-row: 2;
+}
+
+.rule-edit-fullscreen .rule-config-main-card .rule-details-grid label:nth-child(4) {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.rule-edit-fullscreen .rule-config-main-card .rule-details-grid label:nth-child(5) {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.rule-edit-fullscreen .rule-config-card label {
+  gap: 5px;
+}
+
+.rule-edit-fullscreen .rule-config-card input,
+.rule-edit-fullscreen .rule-config-card select,
+.rule-edit-fullscreen .rule-config-card textarea {
+  background: var(--rule-field-bg);
+  border-color: var(--rule-field-border);
+  border-radius: 8px;
+  color: #f4f7f8;
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
+.rule-edit-fullscreen .rule-config-card textarea {
+  min-height: 36px;
+}
+
+.rule-edit-fullscreen .rule-config-card input:hover,
+.rule-edit-fullscreen .rule-config-card select:hover,
+.rule-edit-fullscreen .rule-config-card textarea:hover {
+  background: rgba(255, 255, 255, 0.065);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.rule-edit-fullscreen .rule-config-card input:focus,
+.rule-edit-fullscreen .rule-config-card select:focus,
+.rule-edit-fullscreen .rule-config-card textarea:focus {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(53, 189, 147, 0.42);
+  box-shadow: 0 0 0 3px rgba(53, 189, 147, 0.12);
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-grid {
+  gap: 8px;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-field,
+.rule-edit-fullscreen .rule-config-toggle-card .summary-status,
+.rule-edit-fullscreen .rule-config-toggle-card .ad-limit-panel {
+  background: rgba(255, 255, 255, 0.032);
+  border-color: rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  min-height: 42px;
+  padding: 8px 10px;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-field {
+  grid-template-columns: 54px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-field:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(53, 189, 147, 0.32);
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-switch {
+  background: #5b636c;
+  border: 1px solid #9ca3af;
+  height: 24px;
+  padding: 2px;
+  width: 46px;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-switch::after {
+  height: 18px;
+  width: 18px;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-field input:checked + .toggle-switch {
+  background: #35bd93;
+  border-color: #6ee7b7;
+}
+
+.rule-edit-fullscreen .rule-config-toggle-card .toggle-field input:checked + .toggle-switch::after {
+  transform: translateX(22px);
+}
+
+.rule-editor-section-divider {
+  align-self: center;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+  height: 1px;
+  min-width: 0;
+}
+
+.rule-edit-fullscreen .rule-editor-left-divider {
+  grid-column: 1 / 3;
+  grid-row: 3;
+}
+
+.rule-edit-fullscreen .rule-editor-summary-divider {
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--rule-accent) 32%, rgba(255, 255, 255, 0.16)), transparent);
+  margin: 2px 0;
+}
+
+.rule-edit-fullscreen .rule-editor-stage {
+  display: contents;
+}
+
+.rule-edit-fullscreen .rule-editor-panel {
+  --rule-accent: #58aefe;
+  align-content: start;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
+    var(--rule-card-bg);
+  border: 1px solid var(--rule-card-border);
+  border-top: 3px solid var(--rule-accent);
+  border-radius: 16px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.2);
+  gap: 16px;
+  min-height: 0;
+  overflow: visible;
+  padding: 18px;
+  scrollbar-color: var(--rule-accent) #101011;
+}
+
+.rule-edit-fullscreen .rule-editor-filters-panel {
+  grid-column: 1;
+  grid-row: 4;
+}
+
+.rule-edit-fullscreen .rule-editor-priorities-panel {
+  grid-column: 2;
+  grid-row: 4;
+}
+
+.rule-edit-fullscreen .rule-editor-summary-panel {
+  align-self: stretch;
+  grid-column: 3;
+  grid-row: 2 / 5;
+}
+
+.rule-edit-fullscreen .rule-editor-filters-panel {
+  --rule-accent: #58aefe;
+  --rule-accent-soft: rgba(88, 174, 254, 0.14);
+}
+
+.rule-edit-fullscreen .rule-editor-priorities-panel {
+  --rule-accent: #ff7b86;
+  --rule-accent-soft: rgba(255, 123, 134, 0.14);
+}
+
+.rule-edit-fullscreen .rule-editor-summary-panel {
+  --rule-accent: #8d6af6;
+  --rule-accent-soft: rgba(141, 106, 246, 0.14);
+}
+
+.rule-edit-fullscreen .rule-editor-panel-title {
+  background: color-mix(in srgb, var(--rule-accent) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--rule-accent) 18%, transparent);
+  border-radius: 12px;
+  min-height: 34px;
+  padding: 8px 10px;
+}
+
+.rule-edit-fullscreen .rule-editor-panel-title svg,
+.rule-edit-fullscreen .rule-editor-panel-title .material-symbols-outlined {
+  color: var(--rule-accent);
+}
+
+.rule-edit-fullscreen .rule-editor-panel-title span {
+  color: var(--rule-accent);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.rule-edit-fullscreen .rule-editor-filters-panel .rule-editor-panel-title svg {
+  color: #f4f7f8;
+}
+
+.rule-edit-fullscreen .toggle-grid {
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+
+.rule-edit-fullscreen .rule-details-grid label,
+.rule-edit-fullscreen .ad-limit-panel label {
+  color: rgba(244, 247, 248, 0.74);
+}
+
+.rule-edit-fullscreen input,
+.rule-edit-fullscreen select,
+.rule-edit-fullscreen textarea,
+.rule-edit-fullscreen .toggle-field,
+.rule-edit-fullscreen .summary-status,
+.rule-edit-fullscreen .ad-limit-panel {
+  background: var(--rule-field-bg);
+  border-color: var(--rule-field-border);
+  border-radius: 10px;
+}
+
+.rule-edit-fullscreen input,
+.rule-edit-fullscreen select,
+.rule-edit-fullscreen textarea {
+  min-height: 42px;
+}
+
+.rule-edit-fullscreen textarea {
+  min-height: 58px;
+}
+
+.rule-edit-fullscreen .filter-editor-card,
+.rule-edit-fullscreen .preview-rows-card,
+.rule-edit-fullscreen .rule-summary-card {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+.rule-edit-fullscreen .filter-builder-toolbar {
+  justify-content: flex-end;
+}
+
+.rule-edit-fullscreen .filter-editor-heading h3 {
+  color: #f4f7f8;
+  font-size: 16px;
+  font-weight: 750;
+}
+
+.rule-edit-fullscreen .filter-editor-heading span {
+  color: rgba(244, 247, 248, 0.68);
+}
+
+.rule-edit-fullscreen .condition-row,
+.rule-edit-fullscreen .group-preview,
+.rule-edit-fullscreen .nested-filter-shell,
+.rule-edit-fullscreen .priority-row {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.018)),
+    var(--rule-card-bg-raised);
+  border-color: var(--rule-card-border);
+  border-radius: 12px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.14);
+  min-height: 58px;
+}
+
+.rule-edit-fullscreen .condition-row {
+  grid-template-columns: 1fr;
+}
+
+.rule-edit-fullscreen .priority-row {
+  grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .priority-group-row {
+  grid-template-columns: 36px 38px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .priority-row:not(.priority-view-row):not(.priority-group-row) {
+  grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .priority-direction,
+.rule-edit-fullscreen .priority-row > select {
+  grid-column: 2;
+}
+
+.rule-edit-fullscreen .column-picker-trigger,
+.rule-edit-fullscreen .readonly-cell {
+  background: var(--rule-field-bg);
+  border-color: var(--rule-field-border);
+  border-radius: 10px;
+}
+
+.rule-edit-fullscreen .condition-row input,
+.rule-edit-fullscreen .condition-row select,
+.rule-edit-fullscreen .condition-row textarea,
+.rule-edit-fullscreen .priority-row select,
+.rule-edit-fullscreen .nested-filter-shell input {
+  background: var(--rule-field-bg);
+  border-color: var(--rule-field-border);
+  border-radius: 10px;
+  min-height: 42px;
+}
+
+.rule-edit-fullscreen .condition-row input:hover,
+.rule-edit-fullscreen .condition-row select:hover,
+.rule-edit-fullscreen .condition-row textarea:hover,
+.rule-edit-fullscreen .priority-row select:hover,
+.rule-edit-fullscreen .nested-filter-shell input:hover,
+.rule-edit-fullscreen .column-picker-trigger:hover {
+  background: rgba(255, 255, 255, 0.065);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.rule-edit-fullscreen .condition-row input:focus,
+.rule-edit-fullscreen .condition-row select:focus,
+.rule-edit-fullscreen .condition-row textarea:focus,
+.rule-edit-fullscreen .priority-row select:focus,
+.rule-edit-fullscreen .nested-filter-shell input:focus,
+.rule-edit-fullscreen .column-picker.open .column-picker-trigger,
+.rule-edit-fullscreen .column-picker-trigger:focus-visible {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: color-mix(in srgb, var(--rule-accent) 62%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rule-accent) 18%, transparent);
+}
+
+.rule-edit-fullscreen .relation-separator::before,
+.rule-edit-fullscreen .relation-separator::after {
+  background: var(--rule-accent);
+  opacity: 0.32;
+}
+
+.rule-edit-fullscreen .relation-separator span,
+.rule-edit-fullscreen .segmented {
+  background: #101011;
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.rule-edit-fullscreen .segmented button.selected {
+  background: var(--rule-accent-soft);
+  color: var(--rule-accent);
+}
+
+.rule-edit-fullscreen .preview-strip {
+  background:
+    linear-gradient(180deg, rgba(251, 191, 36, 0.13), rgba(251, 191, 36, 0.055)),
+    var(--rule-card-bg-raised);
+  border: 1px solid rgba(251, 191, 36, 0.24);
+  border-left: 3px solid #d57a00;
+  border-radius: 12px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 10px 12px;
+}
+
+.rule-edit-fullscreen .preview-strip > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.rule-edit-fullscreen .preview-strip div {
+  min-width: 0;
+}
+
+.rule-edit-fullscreen .preview-strip span {
+  color: #d57a00;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.rule-edit-fullscreen .preview-strip strong {
+  color: #f4f7f8;
+  font-size: 18px;
+}
+
+.rule-edit-fullscreen .rule-summary-total,
+.rule-edit-fullscreen .summary-metric-card,
+.rule-edit-fullscreen .preview-rows-card,
+.rule-edit-fullscreen .preview-rows-table-wrap {
+  background: var(--rule-card-bg-raised);
+  border: 1px solid var(--rule-card-border);
+  border-radius: 12px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.14);
+}
+
+.rule-edit-fullscreen .query-preview pre {
+  max-height: none;
+}
+
+.rule-edit-fullscreen .preview-rows-table-wrap {
+  max-height: min(440px, 48vh);
+  overflow-x: auto;
+  overflow-y: auto;
+}
+
+.rule-edit-fullscreen .rule-summary-grid {
+  column-width: 190px;
+}
+
+.rule-edit-fullscreen > .form-actions.end {
+  display: none;
+}

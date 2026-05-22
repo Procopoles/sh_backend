@@ -382,3 +382,24 @@ button:disabled {
 .details-panel-toggle {
   flex: 0 0 auto;
 }
+
+.app-shell.rule-editor-fullscreen {
+  background: #0d0d0e;
+  display: block;
+  min-height: 100vh;
+}
+
+.rule-editor-fullscreen .sidebar,
+.rule-editor-fullscreen .content,
+.rule-editor-fullscreen .details-panel-toggle-bar {
+  display: none;
+}
+
+.rule-editor-fullscreen .portal-editor-panel {
+  background: #0d0d0e;
+  border-left: 0;
+  box-shadow: none;
+  display: block;
+  max-height: none;
+  overflow: visible;
+}

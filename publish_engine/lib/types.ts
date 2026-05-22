@@ -65,6 +65,7 @@ export type PublicationRule = {
   portal_id: number | null;
   portal_name?: string;
   portal_slug?: string;
+  portal_logo_url?: string | null;
   name: string;
   slug: string;
   description: string | null;

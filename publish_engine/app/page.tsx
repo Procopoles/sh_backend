@@ -594,10 +594,6 @@ export default function Home() {
 
   function openRulesView() {
     setActiveView("rules");
-    if (!ruleForm) {
-      if (rules[0]) editRule(rules[0], "view");
-      else resetRuleForm(null);
-    }
   }
 
   function openStatusView() {
@@ -747,7 +743,14 @@ export default function Home() {
     setError(null);
     try {
       await fetchJson(`/api/rules/${id}`, { method: "DELETE" });
-      resetRuleForm(null);
+      setRuleForm(null);
+      setPreviewCount(null);
+      setPreviewLimitedCount(null);
+      setPreviewRows(null);
+      setRuleSummary(null);
+      setSummaryConfig([]);
+      setSummaryConfigCustom(false);
+      setGroupEditor(null);
       await loadAll();
     } catch (currentError) {
       setError(currentError instanceof Error ? currentError.message : "Erro ao excluir regra.");
@@ -947,6 +950,22 @@ export default function Home() {
     setGroupEditor(null);
   }
 
+  function cancelRuleEdit() {
+    if (ruleForm?.id) {
+      returnToRuleView();
+      return;
+    }
+
+    setRuleForm(null);
+    setPreviewCount(null);
+    setPreviewLimitedCount(null);
+    setPreviewRows(null);
+    setRuleSummary(null);
+    setSummaryConfig([]);
+    setSummaryConfigCustom(false);
+    setGroupEditor(null);
+  }
+
   function openCreateGroup(parentPath: number[] = [], insertIndex = ruleForm?.filters.conditions.length ?? 0) {
     if (!ruleForm || !filterableColumns[0]) return;
     setGroupEditor({ mode: "create", path: parentPath, insertIndex, draft: createDefaultGroup(filterableColumns) });
@@ -970,8 +989,10 @@ export default function Home() {
     setGroupEditor(null);
   }
 
+  const ruleEditorFullscreen = activeView === "rules" && Boolean(ruleForm) && isRuleEditing;
+
   return (
-    <main className={`app-shell ${detailsPanelCollapsed ? "details-panel-collapsed" : ""}`}>
+    <main className={`app-shell ${detailsPanelCollapsed ? "details-panel-collapsed" : ""} ${ruleEditorFullscreen ? "rule-editor-fullscreen" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-logo" src="/brand/sh-gerenciamento.png" alt="SH Gerenciamento" />
@@ -1163,7 +1184,11 @@ export default function Home() {
                         >
                           <span className="status-rule-main">
                             <span className="portal-logo rule-node-icon">
-                              <MaterialIcon name="monitor_heart" size={18} />
+                              {group.portal?.logo_url || rule.portal_logo_url ? (
+                                <img src={group.portal?.logo_url ?? rule.portal_logo_url ?? ""} alt="" />
+                              ) : (
+                                <MaterialIcon name="monitor_heart" size={18} />
+                              )}
                             </span>
                             <span>
                               <strong>{rule.name}</strong>
@@ -1236,7 +1261,13 @@ export default function Home() {
                   <span className="portal-cell rule-name-cell">
                     <span className="rule-tree-rail" aria-hidden="true" />
                     <span className={`portal-logo rule-node-icon ${depth > 0 ? "child" : ""}`}>
-                      {depth > 0 ? <MaterialIcon name="account_tree" size={18} /> : <Filter size={18} />}
+                      {portalById.get(rule.portal_id ?? -1)?.logo_url || rule.portal_logo_url ? (
+                        <img src={portalById.get(rule.portal_id ?? -1)?.logo_url ?? rule.portal_logo_url ?? ""} alt="" />
+                      ) : depth > 0 ? (
+                        <MaterialIcon name="account_tree" size={18} />
+                      ) : (
+                        <Filter size={18} />
+                      )}
                     </span>
                     <span className="rule-title-copy">
                       <strong>{rule.name}</strong>
@@ -1268,7 +1299,7 @@ export default function Home() {
         )}
       </section>
 
-      <aside className={`portal-editor-panel ${detailsPanelCollapsed ? "collapsed" : ""}`}>
+      <aside className={`portal-editor-panel ${detailsPanelCollapsed && !ruleEditorFullscreen ? "collapsed" : ""}`}>
         <div className="details-panel-toggle-bar">
           <button
             className="icon-button details-panel-toggle"
@@ -1569,11 +1600,16 @@ export default function Home() {
             )}
           </section>
         ) : ruleForm ? (
-            <form className={`rule-form ${isRuleEditing ? "edit-mode" : "view-mode"}`} onSubmit={saveRule}>
-              <div className="panel-heading inset">
-                <div>
-                  <h2>{isRuleEditing ? (ruleForm.id ? "Editar regra" : "Nova regra") : "Detalhes da regra"}</h2>
-                  <span>{ruleForm.portal_id ? portals.find((portal) => portal.id === ruleForm.portal_id)?.name : "Sem portal vinculado"}</span>
+            <form className={`rule-form ${isRuleEditing ? "edit-mode rule-edit-fullscreen" : "view-mode"}`} onSubmit={saveRule}>
+              <div className="panel-heading inset rule-editor-heading">
+                <div className="rule-editor-heading-copy">
+                  <span className="portal-logo rule-editor-logo">
+                    {selectedRulePortal?.logo_url ? <img src={selectedRulePortal.logo_url} alt="" /> : <Globe2 size={22} />}
+                  </span>
+                  <span>
+                    <h2>{isRuleEditing ? (ruleForm.id ? "Editar regra" : "Nova regra") : "Detalhes da regra"}</h2>
+                    <span>{selectedRulePortal?.name ?? "Sem portal vinculado"}</span>
+                  </span>
                 </div>
                 {!isRuleEditing && (
                   <button className="secondary-button compact-button" type="button" onClick={() => setRuleMode("edit")}>
@@ -1581,18 +1617,37 @@ export default function Home() {
                     Editar
                   </button>
                 )}
-                {isRuleEditing && ruleForm.id && (
+                {isRuleEditing && (
                   <div className="panel-heading-actions">
+                    {ruleForm.id && (
                     <button className="secondary-button compact-button" type="button" onClick={returnToRuleView}>
                       <MaterialIcon name="arrow_back" size={17} />
                       Voltar
                     </button>
+                    )}
+                    {ruleForm.id && (
                     <button className="danger-button" type="button" onClick={() => void removeRule(ruleForm.id!)}>
                       <MaterialIcon name="delete" size={18} />
+                    </button>
+                    )}
+                    <button className="ghost-button compact-button" type="button" onClick={cancelRuleEdit}>
+                      <MaterialIcon name="close" size={18} />
+                      Cancelar
+                    </button>
+                    <button className="primary-button compact-button" type="submit" disabled={saving}>
+                      {saving ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="check" size={18} />}
+                      Salvar regra
                     </button>
                   </div>
                 )}
               </div>
+
+              <div className="rule-config-band">
+                <div className="rule-config-card rule-config-main-card">
+                  <div className="rule-config-card-heading">
+                    <span>Configuração</span>
+                    <small>Identificação e origem</small>
+                  </div>
 
               <div className="rule-details-grid">
                 <label>
@@ -1686,7 +1741,13 @@ export default function Home() {
                   </span>
                 </label>
               </div>
+                </div>
 
+                <div className="rule-config-card rule-config-toggle-card">
+                  <div className="rule-config-card-heading">
+                    <span>Configuração</span>
+                    <small>Comportamento da regra</small>
+                  </div>
               <div className="toggle-grid">
                 {isRuleEditing ? (
                 <>
@@ -1784,6 +1845,17 @@ export default function Home() {
                   </label>
                 </div>
               )}
+                </div>
+              </div>
+
+              <div className="rule-editor-section-divider rule-editor-left-divider" aria-hidden="true" />
+
+              <div className="rule-editor-stage">
+                <section className="rule-editor-panel rule-editor-filters-panel">
+                  <div className="rule-editor-panel-title">
+                    <Filter size={35} />
+                    <span>Filtros</span>
+                  </div>
 
               <section className="filter-editor-card">
                 <div className="filter-editor-heading">
@@ -1810,25 +1882,6 @@ export default function Home() {
                   stackOnly
                   readOnly={!isRuleEditing}
                 />
-                <div className="filter-card-divider" />
-                <div className="filter-editor-heading priority-heading">
-                  <div>
-                    <h3>Prioridade de publicacao</h3>
-                    <span className="priority-heading-meta">
-                      <span>{publicationPrioritySummary(ruleForm.publication_priority, filterableColumns)}</span>
-                      {inheritedPriorityPresetName && (
-                        <span className="inherited-priority-badge">herdadas de {inheritedPriorityPresetName}</span>
-                      )}
-                    </span>
-                  </div>
-                  <MaterialIcon name="swap_vert" size={19} className="priority-heading-icon" />
-                </div>
-                <PublicationPriorityEditor
-                  columns={filterableColumns}
-                  value={ruleForm.publication_priority}
-                  onChange={(publicationPriority) => setRuleForm({ ...ruleForm, publication_priority: publicationPriority })}
-                  readOnly={!isRuleEditing}
-                />
                 {queryPanelOpen && (
                   <div className="query-preview">
                     <div className="query-preview-heading">
@@ -1844,6 +1897,40 @@ export default function Home() {
                   </div>
                 )}
               </section>
+
+                </section>
+
+                <section className="rule-editor-panel rule-editor-priorities-panel">
+                  <div className="rule-editor-panel-title">
+                    <MaterialIcon name="swap_vert" size={42} />
+                    <span>Prioridades</span>
+                  </div>
+                  <div className="filter-editor-card priority-editor-card">
+                    <div className="filter-editor-heading priority-heading">
+                      <div>
+                        <h3>Stack</h3>
+                        <span className="priority-heading-meta">
+                          <span>{publicationPrioritySummary(ruleForm.publication_priority, filterableColumns)}</span>
+                          {inheritedPriorityPresetName && (
+                            <span className="inherited-priority-badge">herdadas de {inheritedPriorityPresetName}</span>
+                          )}
+                        </span>
+                      </div>
+                    </div>
+                    <PublicationPriorityEditor
+                      columns={filterableColumns}
+                      value={ruleForm.publication_priority}
+                      onChange={(publicationPriority) => setRuleForm({ ...ruleForm, publication_priority: publicationPriority })}
+                      readOnly={!isRuleEditing}
+                    />
+                  </div>
+                </section>
+
+                <section className="rule-editor-panel rule-editor-summary-panel">
+                  <div className="rule-editor-panel-title">
+                    <MaterialIcon name="donut_large" size={42} />
+                    <span>Resumo</span>
+                  </div>
 
               <div className="preview-strip">
                 <div>
@@ -1879,6 +1966,8 @@ export default function Home() {
                 onConfigChange={updateSummaryConfig}
                 onRefresh={() => void loadRuleSummary()}
               />
+
+              <div className="rule-editor-section-divider rule-editor-summary-divider" aria-hidden="true" />
 
               <section className="preview-rows-card">
                 <div className="preview-rows-heading">
@@ -1992,9 +2081,12 @@ export default function Home() {
                 )}
               </section>
 
+                </section>
+              </div>
+
               {isRuleEditing && (
               <div className="form-actions end">
-                <button className="ghost-button" type="button" onClick={() => resetRuleForm(null)}>
+                <button className="ghost-button" type="button" onClick={cancelRuleEdit}>
                   <MaterialIcon name="close" size={18} />
                   Cancelar
                 </button>

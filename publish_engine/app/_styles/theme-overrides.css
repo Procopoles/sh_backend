@@ -55,3 +55,59 @@
   background: rgba(52, 211, 153, 0.14);
   border-color: rgba(52, 211, 153, 0.36);
 }
+
+.rule-edit-fullscreen .condition-row,
+.rule-edit-fullscreen .portal-editor-panel .condition-row {
+  grid-template-columns: 1fr;
+}
+
+.rule-edit-fullscreen .priority-row,
+.rule-edit-fullscreen .priority-row:not(.priority-view-row):not(.priority-group-row) {
+  grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .priority-group-row {
+  align-items: start;
+  grid-template-columns: 36px 38px minmax(0, 1fr);
+}
+
+.rule-edit-fullscreen .priority-direction,
+.rule-edit-fullscreen .priority-row > select {
+  grid-column: 2;
+}
+
+.rule-edit-fullscreen .group-preview {
+  align-items: start;
+  min-height: auto;
+}
+
+.rule-edit-fullscreen .group-preview-copy {
+  align-self: center;
+  display: grid;
+  gap: 3px;
+  overflow: visible;
+}
+
+.rule-edit-fullscreen .group-preview-copy strong,
+.rule-edit-fullscreen .group-preview-copy small {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.rule-edit-fullscreen .priority-group-copy {
+  align-self: center;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  overflow: visible;
+}
+
+.rule-edit-fullscreen .priority-group-copy strong,
+.rule-edit-fullscreen .priority-group-copy small {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
