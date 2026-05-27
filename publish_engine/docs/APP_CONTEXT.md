@@ -1,6 +1,6 @@
 # Publish Engine - Contexto Atual
 
-Ultima atualizacao: 2026-05-08.
+Ultima atualização: 2026-05-08.
 
 ## Objetivo
 
@@ -12,7 +12,7 @@ A interface precisa permitir:
 - CRUD de tipos/niveis de anuncio e cotas por portal.
 - CRUD de regras de publicacao.
 - Preview de quantidade de imoveis por regra.
-- Criacao, atualizacao e remocao de views `public.pc_*` que representam os imoveis dentro de cada regra.
+- Criacao, atualização e remocao de views `public.pc_*` que representam os imoveis dentro de cada regra.
 
 ## Stack Atual
 

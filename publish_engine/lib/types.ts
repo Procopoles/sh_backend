@@ -16,6 +16,9 @@ export type Portal = {
   description: string | null;
   logo_url: string | null;
   active: boolean;
+  final_listing_refresh_time: string;
+  final_view_refreshed_at?: string | null;
+  final_view_refresh_reason?: string | null;
   created_at: string;
   updated_at: string;
   rules_count?: number;

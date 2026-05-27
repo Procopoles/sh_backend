@@ -91,7 +91,7 @@ export function RuleSummarySection({
           <MaterialIcon name="home_work" size={22} />
         </span>
         <span>
-          <small>Dentro da view final</small>
+          <small>Dentro da listagem final</small>
           <strong>{data ? formatNumber(data.total) : "-"}</strong>
         </span>
       </div>

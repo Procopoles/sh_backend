@@ -15,7 +15,7 @@ export type MetadataResponse = {
   source_views: SourceViewMetadata[];
 };
 
-export type PortalForm = Pick<Portal, "name" | "slug" | "description" | "logo_url" | "active"> & {
+export type PortalForm = Pick<Portal, "name" | "slug" | "description" | "logo_url" | "active" | "final_listing_refresh_time"> & {
   id?: number;
   ad_types: Array<Pick<PortalAdType, "name" | "quantity" | "tier">>;
 };
@@ -62,6 +62,6 @@ export type StatusPortalGroup = {
   rules: PublicationRule[];
 };
 
-export const EMPTY_PORTAL: PortalForm = { name: "", slug: "", description: "", logo_url: null, active: true, ad_types: [] };
+export const EMPTY_PORTAL: PortalForm = { name: "", slug: "", description: "", logo_url: null, active: true, final_listing_refresh_time: "00:00", ad_types: [] };
 export const EMPTY_FILTERS: RuleFilters = { combinator: "and", conditions: [] };
 export const EMPTY_PUBLICATION_PRIORITY: PublicationPriority = [];

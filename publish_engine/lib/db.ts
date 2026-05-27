@@ -101,6 +101,9 @@ async function runControlSchemaMigration(client: PoolClient) {
       description text,
       logo_url text,
       active boolean not null default true,
+      final_listing_refresh_time time not null default '00:00',
+      final_view_refreshed_at timestamptz,
+      final_view_refresh_reason text,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
@@ -328,6 +331,13 @@ async function runControlSchemaMigration(client: PoolClient) {
       end if;
     end
     $$;
+  `);
+
+  await client.query(`
+    alter table if exists publish_portals
+    add column if not exists final_listing_refresh_time time not null default '00:00',
+    add column if not exists final_view_refreshed_at timestamptz,
+    add column if not exists final_view_refresh_reason text;
   `);
 
   await client.query(`

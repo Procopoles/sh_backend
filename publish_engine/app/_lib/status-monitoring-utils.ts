@@ -85,5 +85,5 @@ export function buildStatusUnexpectedQuery(rule: PublicationRule) {
   if (!rule.portal_slug) return "Portal indisponivel para montar a query.";
 
   const finalViewName = statusFinalViewName(rule.portal_slug);
-  return `Publicados indevidos serao tratados fora de public.${quoteSqlIdentifier(finalViewName)}.`;
+  return `Publicados indevidos serao tratados fora da listagem final public.${quoteSqlIdentifier(finalViewName)}.`;
 }

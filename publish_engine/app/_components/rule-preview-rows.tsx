@@ -6,11 +6,19 @@ import { formatNumber } from "../_lib/number-format";
 import { MaterialIcon } from "./material-icon";
 
 type RulePreviewRowsProps = {
+  title?: string;
+  unloadedDescription?: string;
+  defaultSortLabel?: string;
+  previewButtonLabel?: string;
   previewRows: RuleRowsPreview | null;
   previewRowsLimit: 10 | 100;
   previewRowsLoading: boolean;
   previewSortColumn: string;
   previewSortDirection: PreviewSortDirection;
+  crmCode: string;
+  crmPlaceholder?: string;
+  onCrmCodeChange: (value: string) => void;
+  onCrmCodeBlur: () => void;
   onSortColumnChange: (sortColumn: string) => void;
   onSortDirectionChange: (sortDirection: PreviewSortDirection) => void;
   onLimitChange: (limit: 10 | 100) => void;
@@ -18,11 +26,19 @@ type RulePreviewRowsProps = {
 };
 
 export function RulePreviewRows({
+  title = "Linhas do filtro",
+  unloadedDescription = "codigo_crm e campos filtrados",
+  defaultSortLabel = "Ordem da regra",
+  previewButtonLabel = "Pre visualizar",
   previewRows,
   previewRowsLimit,
   previewRowsLoading,
   previewSortColumn,
   previewSortDirection,
+  crmCode,
+  crmPlaceholder = "Filtrar codigo CRM",
+  onCrmCodeChange,
+  onCrmCodeBlur,
   onSortColumnChange,
   onSortDirectionChange,
   onLimitChange,
@@ -32,14 +48,30 @@ export function RulePreviewRows({
     <section className="preview-rows-card">
       <div className="preview-rows-heading">
         <div>
-          <h3>Linhas do filtro</h3>
+          <h3>{title}</h3>
           <span>
             {previewRows
               ? `${formatNumber(previewRows.rows.length)} linha${previewRows.rows.length === 1 ? "" : "s"}`
-              : "codigo_crm e campos filtrados"}
+              : unloadedDescription}
           </span>
         </div>
         <div className="preview-rows-actions">
+          <label className="preview-crm-filter">
+            <MaterialIcon name="manage_search" size={16} />
+            <input
+              value={crmCode}
+              placeholder={crmPlaceholder}
+              aria-label="Filtrar por codigo CRM"
+              onBlur={onCrmCodeBlur}
+              onChange={(event) => onCrmCodeChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  onPreview();
+                }
+              }}
+            />
+          </label>
           <div className="preview-sort-controls">
             <label className="preview-sort-select-wrap">
               <ListOrdered size={15} />
@@ -49,7 +81,7 @@ export function RulePreviewRows({
                 onChange={(event) => onSortColumnChange(event.target.value)}
                 disabled={!previewRows?.columns.length}
               >
-                <option value={PREVIEW_RULE_ORDER_COLUMN}>Ordem da regra</option>
+                <option value={PREVIEW_RULE_ORDER_COLUMN}>{defaultSortLabel}</option>
                 {previewRows?.columns.map((column) => (
                   <option key={column.key} value={column.key}>
                     {column.label}
@@ -87,7 +119,7 @@ export function RulePreviewRows({
           </div>
           <button className="secondary-button compact-button" type="button" onClick={onPreview} disabled={previewRowsLoading}>
             {previewRowsLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="table_rows" size={17} />}
-            Pre visualizar
+            {previewButtonLabel}
           </button>
         </div>
       </div>

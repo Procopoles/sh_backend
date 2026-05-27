@@ -8,6 +8,7 @@ import { FilterGroupBuilder } from "./_components/filter-group-builder";
 import { MaterialIcon } from "./_components/material-icon";
 import { NumericInput } from "./_components/numeric-input";
 import { PortalDirectory } from "./_components/portal-directory";
+import { PortalFinalListingModal } from "./_components/portal-final-listing-modal";
 import { PublicationPriorityEditor, publicationPrioritySummary } from "./_components/publication-priority-editor";
 import { RuleDirectory } from "./_components/rule-directory";
 import { RulePreviewRows } from "./_components/rule-preview-rows";
@@ -19,6 +20,8 @@ import { formatNumber, localizedNumberToNumber } from "./_lib/number-format";
 import {
   AD_TIER_HELP,
   AD_TYPE_NAME_HELP,
+  FINAL_LISTING_COLUMNS,
+  FINAL_LISTING_DEFAULT_SUMMARY_COLUMNS,
   HEALTHCHECK_INTERVAL_MINUTES,
   HEALTHCHECK_INTERVAL_MS,
   PORTAL_SLUG_HELP,
@@ -46,7 +49,7 @@ import {
   ruleAdLimitQuota,
   ruleTotalQuota
 } from "./_lib/portal-form-utils";
-import { createDefaultRuleSummaryConfig } from "./_lib/rule-summary-defaults";
+import { createDefaultRuleSummaryConfig, createSummaryConfigItem } from "./_lib/rule-summary-defaults";
 import {
   cloneGroup,
   createDefaultGroup,
@@ -66,7 +69,7 @@ import {
   statusFinalViewName,
   statusLabel
 } from "./_lib/status-monitoring-utils";
-import { buildAdLimitSql, buildRuleSelectSql, sanitizeFilters, sanitizePublicationPriority } from "@/lib/rules";
+import { sanitizePublicationPriority } from "@/lib/rules";
 import type {
   Portal,
   PortalAdType,
@@ -78,6 +81,12 @@ import type {
   RuleSummaryConfigItem,
   RuleSummaryResponse
 } from "@/lib/types";
+
+type RuleQueryPreviewResponse = {
+  select_sql: string;
+  view_sql: string | null;
+  view_name: string | null;
+};
 
 export default function Home() {
   const [portals, setPortals] = useState<Portal[]>([]);
@@ -100,13 +109,28 @@ export default function Home() {
   const [previewRowsLoading, setPreviewRowsLoading] = useState(false);
   const [previewSortColumn, setPreviewSortColumn] = useState(PREVIEW_RULE_ORDER_COLUMN);
   const [previewSortDirection, setPreviewSortDirection] = useState<PreviewSortDirection>("asc");
+  const [previewCrmCode, setPreviewCrmCode] = useState("");
   const [summaryConfig, setSummaryConfig] = useState<RuleSummaryConfigItem[]>([]);
   const [summaryConfigCustom, setSummaryConfigCustom] = useState(false);
   const [ruleSummary, setRuleSummary] = useState<RuleSummaryResponse | null>(null);
   const [ruleSummaryLoading, setRuleSummaryLoading] = useState(false);
+  const [finalListingPortalId, setFinalListingPortalId] = useState<number | null>(null);
+  const [finalSummaryConfig, setFinalSummaryConfig] = useState<RuleSummaryConfigItem[]>([]);
+  const [finalSummaryConfigCustom, setFinalSummaryConfigCustom] = useState(false);
+  const [finalSummary, setFinalSummary] = useState<RuleSummaryResponse | null>(null);
+  const [finalSummaryLoading, setFinalSummaryLoading] = useState(false);
+  const [finalPreviewRowsLimit, setFinalPreviewRowsLimit] = useState<10 | 100>(10);
+  const [finalPreviewRows, setFinalPreviewRows] = useState<RuleRowsPreview | null>(null);
+  const [finalPreviewRowsLoading, setFinalPreviewRowsLoading] = useState(false);
+  const [finalPreviewSortColumn, setFinalPreviewSortColumn] = useState(PREVIEW_RULE_ORDER_COLUMN);
+  const [finalPreviewSortDirection, setFinalPreviewSortDirection] = useState<PreviewSortDirection>("asc");
+  const [finalPreviewCrmCode, setFinalPreviewCrmCode] = useState("");
+  const [finalRefreshLoading, setFinalRefreshLoading] = useState(false);
   const [healthcheckLoading, setHealthcheckLoading] = useState(false);
   const [selectedStatusRuleId, setSelectedStatusRuleId] = useState<number | null>(null);
   const [queryPanelOpen, setQueryPanelOpen] = useState(false);
+  const [ruleQueryPreview, setRuleQueryPreview] = useState<RuleQueryPreviewResponse | null>(null);
+  const [ruleQueryLoading, setRuleQueryLoading] = useState(false);
   const [queryCopied, setQueryCopied] = useState(false);
   const [viewNameCopied, setViewNameCopied] = useState(false);
   const [automationSqlCopied, setAutomationSqlCopied] = useState(false);
@@ -115,8 +139,18 @@ export default function Home() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const healthcheckInFlightRef = useRef(false);
+  const savingRef = useRef(false);
   const summaryRequestIdRef = useRef(0);
   const summaryRequestSignatureRef = useRef("");
+  const ruleQueryRequestIdRef = useRef(0);
+  const ruleQuerySignatureRef = useRef("");
+  const finalSummaryRequestIdRef = useRef(0);
+  const finalListingPortalIdRef = useRef<number | null>(null);
+  const activeFinalSummaryConfigRef = useRef<RuleSummaryConfigItem[]>([]);
+  const finalSummaryConfigByPortalRef = useRef(
+    new Map<number, { config: RuleSummaryConfigItem[]; custom: boolean }>()
+  );
+  const finalPreviewRowsRequestIdRef = useRef(0);
   const previewCountRequestIdRef = useRef(0);
   const previewRowsRequestIdRef = useRef(0);
   const previewRequestSignatureRef = useRef("");
@@ -142,6 +176,19 @@ export default function Home() {
     [filterableColumns, ruleForm?.filters, ruleForm?.publication_priority]
   );
   const activeSummaryConfig = summaryConfigCustom ? summaryConfig : defaultSummaryConfig;
+  const finalSummaryColumns = useMemo(
+    () => buildFinalListingSummaryColumns(filterableColumns),
+    [filterableColumns]
+  );
+  const defaultFinalSummaryConfig = useMemo(
+    () =>
+      FINAL_LISTING_DEFAULT_SUMMARY_COLUMNS.flatMap((columnName) => {
+        const column = finalSummaryColumns.find((item) => item.column_name === finalListingSummaryColumnKey("final", columnName));
+        return column ? [createSummaryConfigItem(column)] : [];
+      }).filter(Boolean),
+    [finalSummaryColumns]
+  );
+  const activeFinalSummaryConfig = finalSummaryConfigCustom ? finalSummaryConfig : defaultFinalSummaryConfig;
   const activeViewTitle =
     activeView === "portals"
       ? "Portais"
@@ -149,7 +196,7 @@ export default function Home() {
         ? "Regras"
         : activeView === "automations"
           ? "Automacoes"
-          : "Status";
+          : "Atualizar listagem";
   const searchPlaceholder =
     activeView === "portals"
       ? "Buscar portal"
@@ -207,6 +254,8 @@ export default function Home() {
   const selectedStatusPortal = selectedStatusRule?.portal_id ? portalById.get(selectedStatusRule.portal_id) ?? null : null;
   const selectedAutomation =
     (selectedAutomationKey == null ? null : automations.find((automation) => automation.key === selectedAutomationKey)) ?? null;
+  const finalListingPortal =
+    (finalListingPortalId == null ? null : portals.find((portal) => portal.id === finalListingPortalId)) ?? null;
   const selectedPortalRules = rules.filter((rule) => rule.portal_id != null && rule.portal_id === selectedPortalId);
   const selectedRulePortal = portals.find((portal) => portal.id === ruleForm?.portal_id) ?? null;
   const ruleByViewName = useMemo(
@@ -259,28 +308,22 @@ export default function Home() {
     return options;
   }, [metadata?.source_views, portalById, ruleByViewName, rules, ruleForm?.id, ruleForm?.source_table]);
 
-  const currentRuleQuery = useMemo(() => {
-    if (!ruleForm) return "";
-    if (!filterableColumns.length) return "Metadados de colunas indisponiveis.";
-
-    try {
-      const filters = sanitizeFilters(ruleForm.filters, filterableColumns);
-      const publicationPriority = sanitizePublicationPriority(ruleForm.publication_priority, filterableColumns);
-      const limitSql = ruleForm.use_ad_limit ? buildAdLimitSql(ruleForm.portal_id, currentAdLimitType) : null;
-      return buildRuleSelectSql(
-        ruleForm.source_table,
-        filters,
-        filterableColumns,
-        ruleForm.include_locked,
-        ruleForm.active,
-        undefined,
-        publicationPriority,
-        limitSql
-      );
-    } catch (currentError) {
-      return currentError instanceof Error ? currentError.message : "Nao foi possivel montar a query.";
-    }
-  }, [currentAdLimitType, filterableColumns, ruleForm]);
+  const ruleQuerySignature = useMemo(() => {
+    if (!ruleForm || !queryPanelOpen) return "";
+    return JSON.stringify({
+      id: ruleForm.id ?? null,
+      view_name: ruleForm.view_name ?? null,
+      active: ruleForm.active,
+      include_locked: ruleForm.include_locked,
+      source_table: ruleForm.source_table,
+      portal_id: ruleForm.portal_id,
+      use_ad_limit: ruleForm.use_ad_limit,
+      ad_limit_type: currentAdLimitType,
+      filters: ruleForm.filters,
+      publication_priority: ruleForm.publication_priority
+    });
+  }, [currentAdLimitType, queryPanelOpen, ruleForm]);
+  const currentRuleQuery = ruleQueryPreview?.view_sql ?? ruleQueryPreview?.select_sql ?? "";
   const previewRequestSignature = useMemo(() => {
     if (!ruleForm) return "";
     return JSON.stringify({
@@ -308,14 +351,56 @@ export default function Home() {
       items: activeSummaryConfig
     });
   }, [activeSummaryConfig, currentAdLimitType, ruleForm]);
+  const finalSummaryRequestSignature = useMemo(() => {
+    if (!finalListingPortalId) return "";
+    return JSON.stringify({
+      portal_id: finalListingPortalId,
+      items: activeFinalSummaryConfig
+    });
+  }, [activeFinalSummaryConfig, finalListingPortalId]);
 
   useEffect(() => {
     void loadAll();
   }, []);
 
   useEffect(() => {
+    savingRef.current = saving;
+  }, [saving]);
+
+  useEffect(() => {
+    finalListingPortalIdRef.current = finalListingPortalId;
+  }, [finalListingPortalId]);
+
+  useEffect(() => {
+    activeFinalSummaryConfigRef.current = activeFinalSummaryConfig;
+  }, [activeFinalSummaryConfig]);
+
+  useEffect(() => {
     setQueryCopied(false);
   }, [currentRuleQuery, queryPanelOpen]);
+
+  useEffect(() => {
+    ruleQuerySignatureRef.current = ruleQuerySignature;
+    ruleQueryRequestIdRef.current += 1;
+
+    if (!queryPanelOpen || !ruleForm || !ruleQuerySignature) {
+      setRuleQueryPreview(null);
+      setRuleQueryLoading(false);
+      return;
+    }
+
+    setRuleQueryPreview(null);
+    setRuleQueryLoading(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      void loadRuleQueryPreview(controller.signal, ruleQuerySignature);
+    }, 350);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [queryPanelOpen, ruleQuerySignature]);
 
   useEffect(() => {
     setViewNameCopied(false);
@@ -336,6 +421,12 @@ export default function Home() {
     if (previewRows?.columns.some((column) => column.key === previewSortColumn)) return;
     setPreviewSortColumn(PREVIEW_RULE_ORDER_COLUMN);
   }, [previewRows, previewSortColumn]);
+
+  useEffect(() => {
+    if (finalPreviewSortColumn === PREVIEW_RULE_ORDER_COLUMN) return;
+    if (finalPreviewRows?.columns.some((column) => column.key === finalPreviewSortColumn)) return;
+    setFinalPreviewSortColumn(PREVIEW_RULE_ORDER_COLUMN);
+  }, [finalPreviewRows, finalPreviewSortColumn]);
 
   useEffect(() => {
     summaryRequestSignatureRef.current = summaryRequestSignature;
@@ -359,6 +450,35 @@ export default function Home() {
       controller.abort();
     };
   }, [summaryRequestSignature]);
+
+  useEffect(() => {
+    finalSummaryRequestIdRef.current += 1;
+
+    if (!finalListingPortalId || !finalSummaryRequestSignature) {
+      setFinalSummary(null);
+      setFinalSummaryLoading(false);
+      return;
+    }
+
+    setFinalSummary(null);
+    setFinalSummaryLoading(true);
+    const controller = new AbortController();
+    const portalId = finalListingPortalId;
+    const items = activeFinalSummaryConfig;
+    const timeout = window.setTimeout(() => {
+      void loadPortalFinalSummary({
+        signal: controller.signal,
+        portalId,
+        items,
+        source: "signature-change"
+      });
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [finalSummaryRequestSignature]);
 
   useEffect(() => {
     previewRequestSignatureRef.current = previewRequestSignature;
@@ -444,6 +564,17 @@ export default function Home() {
     }
   }
 
+  async function refreshAllData() {
+    setLoading(true);
+    setError(null);
+    try {
+      await loadAll();
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao atualizar dados.");
+      setLoading(false);
+    }
+  }
+
   function resetRulePreviewState() {
     previewCountRequestIdRef.current += 1;
     previewRowsRequestIdRef.current += 1;
@@ -456,6 +587,7 @@ export default function Home() {
     setPreviewCountLoading(false);
     setPreviewRows(null);
     setPreviewRowsLoading(false);
+    setPreviewCrmCode("");
   }
 
   function resetRuleForm(portalId: number | null = null) {
@@ -488,6 +620,7 @@ export default function Home() {
       description: portal.description ?? "",
       logo_url: portal.logo_url ?? null,
       active: portal.active,
+      final_listing_refresh_time: normalizePortalRefreshTime(portal.final_listing_refresh_time),
       ad_types: (portal.ad_types ?? []).map((adType) => ({
         name: adType.name,
         quantity: adType.quantity,
@@ -747,7 +880,8 @@ export default function Home() {
           ad_limit_type: currentAdLimitType,
           limit,
           preview_sort_column: sortColumn === PREVIEW_RULE_ORDER_COLUMN ? null : sortColumn,
-          preview_sort_direction: sortDirection
+          preview_sort_direction: sortDirection,
+          crm_code: normalizeCrmInput(previewCrmCode)
         })
       });
       if (requestId === previewRowsRequestIdRef.current && requestSignature === previewRequestSignatureRef.current) {
@@ -783,7 +917,30 @@ export default function Home() {
     }
   }
 
+  async function loadRuleQueryPreview(signal?: AbortSignal, requestSignature = ruleQuerySignature) {
+    if (!ruleForm || !requestSignature) return;
+    const requestId = ++ruleQueryRequestIdRef.current;
+    setRuleQueryLoading(true);
+    setError(null);
+    try {
+      const result = await fetchJson<RuleQueryPreviewResponse>("/api/rules/preview/query", {
+        method: "POST",
+        signal,
+        body: JSON.stringify({ ...ruleForm, ad_limit_type: currentAdLimitType })
+      });
+      if (!signal?.aborted && requestId === ruleQueryRequestIdRef.current && requestSignature === ruleQuerySignatureRef.current) {
+        setRuleQueryPreview(result);
+      }
+    } catch (currentError) {
+      if (signal?.aborted) return;
+      setError(currentError instanceof Error ? currentError.message : "Erro ao gerar preview da query.");
+    } finally {
+      if (!signal?.aborted && requestId === ruleQueryRequestIdRef.current) setRuleQueryLoading(false);
+    }
+  }
+
   async function loadRuleHealthchecks(ruleId?: number) {
+    if (savingRef.current) return;
     if (healthcheckInFlightRef.current) return;
     healthcheckInFlightRef.current = true;
     setHealthcheckLoading(true);
@@ -882,6 +1039,277 @@ export default function Home() {
     setSummaryConfigCustom(isCustom);
     setRuleForm((current) => (current ? { ...current, summary_config: isCustom ? config : null } : current));
     void saveSummaryConfig(config, isCustom);
+  }
+
+  function openPortalFinalListing() {
+    if (!portalForm.id) return;
+    const portalId = portalForm.id;
+    const savedConfig = finalSummaryConfigByPortalRef.current.get(portalId);
+    const nextConfig = savedConfig?.config ?? [];
+    const nextCustom = savedConfig?.custom ?? false;
+    const nextActiveConfig = nextCustom ? nextConfig : defaultFinalSummaryConfig;
+    finalListingPortalIdRef.current = portalId;
+    activeFinalSummaryConfigRef.current = nextActiveConfig;
+    setFinalListingPortalId(portalId);
+    setFinalSummaryConfig(nextConfig);
+    setFinalSummaryConfigCustom(nextCustom);
+    setFinalSummary(null);
+    setFinalPreviewRows(null);
+    setFinalPreviewRowsLimit(10);
+    setFinalPreviewSortColumn(PREVIEW_RULE_ORDER_COLUMN);
+    setFinalPreviewSortDirection("asc");
+    setFinalPreviewCrmCode("");
+    void previewPortalFinalRows({
+      portalId,
+      limit: 10,
+      sortColumn: PREVIEW_RULE_ORDER_COLUMN,
+      sortDirection: "asc",
+      crmCode: ""
+    });
+  }
+
+  function closePortalFinalListing() {
+    finalSummaryRequestIdRef.current += 1;
+    finalPreviewRowsRequestIdRef.current += 1;
+    finalListingPortalIdRef.current = null;
+    setFinalListingPortalId(null);
+    setFinalSummary(null);
+    setFinalSummaryLoading(false);
+    setFinalPreviewRows(null);
+    setFinalPreviewRowsLoading(false);
+    setFinalRefreshLoading(false);
+  }
+
+  function updateFinalSummaryConfig(config: RuleSummaryConfigItem[]) {
+    const isDefaultConfig = JSON.stringify(config) === JSON.stringify(defaultFinalSummaryConfig);
+    const nextConfig = isDefaultConfig ? [] : config;
+    const nextCustom = !isDefaultConfig;
+    const nextActiveConfig = nextCustom ? config : defaultFinalSummaryConfig;
+    const portalId = finalListingPortalIdRef.current ?? finalListingPortalId;
+    setFinalSummaryConfig(nextConfig);
+    setFinalSummaryConfigCustom(nextCustom);
+    activeFinalSummaryConfigRef.current = nextActiveConfig;
+    if (portalId) {
+      finalSummaryConfigByPortalRef.current.set(portalId, { config: nextConfig, custom: nextCustom });
+      console.info("[publish-engine] portal-final.summary.config-applied", {
+        portalId,
+        custom: nextCustom,
+        itemCount: nextActiveConfig.length,
+        columns: nextActiveConfig.map((item) => item.column)
+      });
+      void loadPortalFinalSummary({
+        portalId,
+        items: nextActiveConfig,
+        source: "config-apply"
+      });
+    }
+  }
+
+  async function loadPortalFinalSummary(options: {
+    signal?: AbortSignal;
+    portalId?: number | null;
+    items?: RuleSummaryConfigItem[];
+    refresh?: boolean;
+    source?: string;
+  } = {}) {
+    const portalId = options.portalId ?? finalListingPortalIdRef.current ?? finalListingPortalId;
+    if (!portalId) return;
+    const items = options.items ?? activeFinalSummaryConfigRef.current;
+    const requestId = ++finalSummaryRequestIdRef.current;
+    const clientRequestId = createClientRequestId("portal-final-summary", requestId);
+    const startedAt = performance.now();
+    setFinalSummaryLoading(true);
+    setError(null);
+    console.info("[publish-engine] portal-final.summary.start", {
+      clientRequestId,
+      requestId,
+      portalId,
+      source: options.source ?? "manual",
+      refresh: options.refresh ?? false,
+      itemCount: items.length,
+      columns: items.map((item) => item.column)
+    });
+    try {
+      const result = await fetchJson<RuleSummaryResponse>("/api/publication/final/preview/summary", {
+        method: "POST",
+        signal: options.signal,
+        body: JSON.stringify({
+          portal_id: portalId,
+          items,
+          refresh: options.refresh ?? false,
+          client_request_id: clientRequestId
+        })
+      });
+      if (!options.signal?.aborted && requestId === finalSummaryRequestIdRef.current && portalId === finalListingPortalIdRef.current) {
+        setFinalSummary(result);
+        console.info("[publish-engine] portal-final.summary.ok", {
+          clientRequestId,
+          requestId,
+          portalId,
+          total: result.total,
+          resultItems: result.items.length,
+          elapsedMs: Math.round(performance.now() - startedAt)
+        });
+      } else {
+        console.info("[publish-engine] portal-final.summary.discarded", {
+          clientRequestId,
+          requestId,
+          portalId,
+          aborted: Boolean(options.signal?.aborted),
+          latestRequestId: finalSummaryRequestIdRef.current,
+          currentPortalId: finalListingPortalIdRef.current,
+          elapsedMs: Math.round(performance.now() - startedAt)
+        });
+      }
+    } catch (currentError) {
+      if (options.signal?.aborted) return;
+      console.error("[publish-engine] portal-final.summary.error", {
+        clientRequestId,
+        requestId,
+        portalId,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: currentError
+      });
+      setError(currentError instanceof Error ? currentError.message : "Erro ao gerar resumo da listagem final.");
+    } finally {
+      if (!options.signal?.aborted && requestId === finalSummaryRequestIdRef.current) setFinalSummaryLoading(false);
+    }
+  }
+
+  async function previewPortalFinalRows(options: {
+    portalId?: number;
+    sortColumn?: string;
+    sortDirection?: PreviewSortDirection;
+    limit?: 10 | 100;
+    crmCode?: string;
+    refresh?: boolean;
+  } = {}) {
+    const portalId = options.portalId ?? finalListingPortalId;
+    if (!portalId) return;
+    const sortColumn = options.sortColumn ?? finalPreviewSortColumn;
+    const sortDirection = options.sortDirection ?? finalPreviewSortDirection;
+    const limit = options.limit ?? finalPreviewRowsLimit;
+    const crmCode = normalizeCrmInput(options.crmCode ?? finalPreviewCrmCode);
+    const requestId = ++finalPreviewRowsRequestIdRef.current;
+    const clientRequestId = createClientRequestId("portal-final-rows", requestId);
+    const startedAt = performance.now();
+    setFinalPreviewRowsLoading(true);
+    setError(null);
+    console.info("[publish-engine] portal-final.rows.start", {
+      clientRequestId,
+      requestId,
+      portalId,
+      limit,
+      sortColumn,
+      sortDirection,
+      crmCode: crmCode ? "[filtered]" : null,
+      refresh: options.refresh ?? false
+    });
+    try {
+      const result = await fetchJson<RuleRowsPreview>("/api/publication/final/preview/rows", {
+        method: "POST",
+        body: JSON.stringify({
+          portal_id: portalId,
+          limit,
+          preview_sort_column: sortColumn === PREVIEW_RULE_ORDER_COLUMN ? null : sortColumn,
+          preview_sort_direction: sortDirection,
+          crm_code: crmCode,
+          refresh: options.refresh ?? false,
+          client_request_id: clientRequestId
+        })
+      });
+      if (requestId === finalPreviewRowsRequestIdRef.current) {
+        setFinalPreviewRows(result);
+        setFinalPreviewCrmCode(crmCode);
+        console.info("[publish-engine] portal-final.rows.ok", {
+          clientRequestId,
+          requestId,
+          portalId,
+          rowCount: result.rows.length,
+          columnCount: result.columns.length,
+          elapsedMs: Math.round(performance.now() - startedAt)
+        });
+      } else {
+        console.info("[publish-engine] portal-final.rows.discarded", {
+          clientRequestId,
+          requestId,
+          portalId,
+          latestRequestId: finalPreviewRowsRequestIdRef.current,
+          elapsedMs: Math.round(performance.now() - startedAt)
+        });
+      }
+    } catch (currentError) {
+      console.error("[publish-engine] portal-final.rows.error", {
+        clientRequestId,
+        requestId,
+        portalId,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: currentError
+      });
+      setError(currentError instanceof Error ? currentError.message : "Erro na pre visualizacao da listagem final.");
+    } finally {
+      if (requestId === finalPreviewRowsRequestIdRef.current) setFinalPreviewRowsLoading(false);
+    }
+  }
+
+  async function refreshPortalFinalListing() {
+    const portalId = finalListingPortalIdRef.current ?? finalListingPortalId;
+    if (!portalId) return;
+    const items = activeFinalSummaryConfigRef.current;
+    const requestId = createClientRequestId("portal-final-refresh");
+    const startedAt = performance.now();
+    setFinalRefreshLoading(true);
+    setError(null);
+    console.info("[publish-engine] portal-final.refresh.start", {
+      clientRequestId: requestId,
+      portalId,
+      summaryItemCount: items.length,
+      summaryColumns: items.map((item) => item.column)
+    });
+    try {
+      await fetchJson("/api/publication/final/refresh", {
+        method: "POST",
+        body: JSON.stringify({ portal_id: portalId, client_request_id: requestId })
+      });
+      await Promise.all([
+        loadPortalFinalSummary({ portalId, items, refresh: false, source: "refresh-after-final-refresh" }),
+        previewPortalFinalRows({ portalId, refresh: false })
+      ]);
+      console.info("[publish-engine] portal-final.refresh.ok", {
+        clientRequestId: requestId,
+        portalId,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      });
+    } catch (currentError) {
+      console.error("[publish-engine] portal-final.refresh.error", {
+        clientRequestId: requestId,
+        portalId,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: currentError
+      });
+      setError(currentError instanceof Error ? currentError.message : "Erro ao atualizar listagem final.");
+    } finally {
+      setFinalRefreshLoading(false);
+    }
+  }
+
+  async function refreshStatusListing(rule?: PublicationRule | null) {
+    const portalId = rule?.portal_id ?? null;
+    const requestId = createClientRequestId("status-final-refresh");
+    setFinalRefreshLoading(true);
+    setError(null);
+    try {
+      await fetchJson("/api/publication/final/refresh", {
+        method: "POST",
+        body: JSON.stringify({ portal_id: portalId, client_request_id: requestId })
+      });
+      await loadAll();
+      await loadRuleHealthchecks(rule?.id);
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao atualizar listagem.");
+    } finally {
+      setFinalRefreshLoading(false);
+    }
   }
 
   async function copyCurrentRuleQuery() {
@@ -1038,13 +1466,13 @@ export default function Home() {
           </button>
           <button className={`nav-item ${activeView === "automations" ? "selected" : ""}`} type="button" onClick={openAutomationsView}>
             <MaterialIcon name="bolt" size={18} />
-            Automacoes
+            Automações
           </button>
         </nav>
         <nav className="sidebar-nav sidebar-nav-bottom" aria-label="Status">
           <button className={`nav-item ${activeView === "status" ? "selected" : ""}`} type="button" onClick={openStatusView}>
             <MaterialIcon name="monitor_heart" size={18} />
-            Status
+            Listagem
           </button>
         </nav>
       </aside>
@@ -1057,7 +1485,7 @@ export default function Home() {
               <button
                 className="ghost-button topbar-refresh-button"
                 type="button"
-                onClick={() => void loadAll()}
+                onClick={() => void refreshAllData()}
                 disabled={loading}
                 title="Atualizar dados"
                 aria-label="Atualizar dados"
@@ -1092,9 +1520,9 @@ export default function Home() {
               {activeView === "portals" ? "Adicionar portal" : "Nova regra"}
             </button>
             ) : activeView === "status" ? (
-            <button className="secondary-button add-portal-button" type="button" onClick={() => void loadRuleHealthchecks()} disabled={healthcheckLoading}>
-              {healthcheckLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={18} />}
-              Verificar ativas
+            <button className="secondary-button add-portal-button" type="button" onClick={() => void refreshStatusListing(null)} disabled={healthcheckLoading || finalRefreshLoading}>
+              {healthcheckLoading || finalRefreshLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={18} />}
+              Atualizar listagem
             </button>
             ) : null}
           </div>
@@ -1156,7 +1584,7 @@ export default function Home() {
                 : activeView === "automations"
                   ? "Detalhes da automacao"
                   : activeView === "status"
-                    ? "Status"
+                    ? "Atualizar listagem"
                     : "Detalhes da regra"}
             </span>
           )}
@@ -1278,6 +1706,16 @@ export default function Home() {
                     <strong>Status</strong>
                     <small>{portalForm.active ? "Ativo" : "Inativo"}</small>
                   </span>
+                </label>
+                <label className="portal-refresh-time-field">
+                  <span>Atualização completa</span>
+                  <input
+                    type="time"
+                    value={portalForm.final_listing_refresh_time}
+                    onChange={(event) =>
+                      setPortalForm({ ...portalForm, final_listing_refresh_time: normalizePortalRefreshTime(event.target.value) })
+                    }
+                  />
                 </label>
               </div>
             </div>
@@ -1411,7 +1849,22 @@ export default function Home() {
               <span>Status</span>
               <strong>{portalForm.active ? "Ativo" : "Inativo"}</strong>
             </div>
+            <div>
+              <span>Atualização</span>
+              <strong>{portalForm.final_listing_refresh_time}</strong>
+            </div>
           </div>
+
+          <button className="portal-final-listing-button" type="button" onClick={openPortalFinalListing} disabled={!portalForm.id}>
+            <span className="portal-final-listing-icon">
+              <MaterialIcon name="table_view" size={22} />
+            </span>
+            <span>
+              <strong>Listagem final</strong>
+              <small>Resumo e pre visualizacao do portal</small>
+            </span>
+            <MaterialIcon name="arrow_forward" size={18} />
+          </button>
 
           <div className="quota-editor">
             <div className="quota-heading">
@@ -1549,7 +2002,7 @@ export default function Home() {
           <section className="status-side-panel">
             <div className="panel-heading inset">
               <div>
-                <h2>{selectedStatusRule ? selectedStatusRule.name : "Status"}</h2>
+                <h2>{selectedStatusRule ? selectedStatusRule.name : "Atualizar listagem"}</h2>
                 <span>
                   {selectedStatusRule
                     ? `${selectedStatusPortal?.name ?? selectedStatusRule.portal_name ?? "Portal"} - ${statusLabel(selectedStatusRule)}`
@@ -1570,9 +2023,9 @@ export default function Home() {
                     Regra
                   </button>
                 )}
-                <button className="secondary-button compact-button" type="button" onClick={() => void loadRuleHealthchecks(selectedStatusRule?.id)} disabled={healthcheckLoading}>
-                  {healthcheckLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={17} />}
-                  Verificar
+                <button className="secondary-button compact-button" type="button" onClick={() => void refreshStatusListing(selectedStatusRule)} disabled={healthcheckLoading || finalRefreshLoading}>
+                  {healthcheckLoading || finalRefreshLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={17} />}
+                  Atualizar listagem
                 </button>
               </div>
             </div>
@@ -1611,7 +2064,7 @@ export default function Home() {
                 <div className="status-query-card">
                   <div className="status-query-heading">
                     <span>Query de publicados</span>
-                    <strong>{selectedStatusRule.portal_slug ? statusFinalViewName(selectedStatusRule.portal_slug) : "View final indisponivel"}</strong>
+                    <strong>{selectedStatusRule.portal_slug ? statusFinalViewName(selectedStatusRule.portal_slug) : "Listagem final indisponivel"}</strong>
                   </div>
                   <pre>{buildStatusPublishedQuery(selectedStatusRule)}</pre>
                 </div>
@@ -1619,7 +2072,7 @@ export default function Home() {
                 <div className="status-query-card">
                   <div className="status-query-heading">
                     <span>Query de publicados indevidos</span>
-                    <strong>Fora da view final</strong>
+                    <strong>Fora da listagem final</strong>
                   </div>
                   <pre>{buildStatusUnexpectedQuery(selectedStatusRule)}</pre>
                 </div>
@@ -1931,14 +2384,14 @@ export default function Home() {
                 {queryPanelOpen && (
                   <div className="query-preview">
                     <div className="query-preview-heading">
-                      <span>Query atual</span>
-                      <button className="ghost-button compact-button" type="button" onClick={() => void copyCurrentRuleQuery()}>
+                      <span>{ruleQueryPreview?.view_name ? `View ${ruleQueryPreview.view_name}` : "Query da regra"}</span>
+                      <button className="ghost-button compact-button" type="button" onClick={() => void copyCurrentRuleQuery()} disabled={!currentRuleQuery || ruleQueryLoading}>
                         <MaterialIcon name={queryCopied ? "done" : "content_copy"} size={17} />
                         {queryCopied ? "Copiada" : "Copiar"}
                       </button>
                     </div>
                     <pre>
-                      <code>{currentRuleQuery}</code>
+                      <code>{ruleQueryLoading ? "Gerando query..." : currentRuleQuery || "Query indisponivel."}</code>
                     </pre>
                   </div>
                 )}
@@ -2021,6 +2474,9 @@ export default function Home() {
                 previewRowsLoading={previewRowsLoading}
                 previewSortColumn={previewSortColumn}
                 previewSortDirection={previewSortDirection}
+                crmCode={previewCrmCode}
+                onCrmCodeChange={setPreviewCrmCode}
+                onCrmCodeBlur={() => setPreviewCrmCode((value) => normalizeCrmInput(value))}
                 onSortColumnChange={(sortColumn) => {
                   setPreviewSortColumn(sortColumn);
                   if (previewRows) void previewRuleRows({ sortColumn });
@@ -2119,6 +2575,44 @@ export default function Home() {
           </section>
         ))}
       </aside>
+
+      {finalListingPortal && (
+        <PortalFinalListingModal
+          portal={finalListingPortal}
+          columns={finalSummaryColumns}
+          summaryConfig={activeFinalSummaryConfig}
+          defaultSummaryConfig={defaultFinalSummaryConfig}
+          summaryData={finalSummary}
+          summaryLoading={finalSummaryLoading}
+          previewRows={finalPreviewRows}
+          previewRowsLimit={finalPreviewRowsLimit}
+          previewRowsLoading={finalPreviewRowsLoading}
+          previewSortColumn={finalPreviewSortColumn}
+          previewSortDirection={finalPreviewSortDirection}
+          crmCode={finalPreviewCrmCode}
+          refreshLoading={finalRefreshLoading}
+          onClose={closePortalFinalListing}
+          onRefresh={() => void refreshPortalFinalListing()}
+          onSummaryConfigChange={updateFinalSummaryConfig}
+          onSummaryRefresh={() => void loadPortalFinalSummary()}
+          onSortColumnChange={(sortColumn) => {
+            setFinalPreviewSortColumn(sortColumn);
+            if (finalPreviewRows) void previewPortalFinalRows({ sortColumn });
+          }}
+          onSortDirectionChange={(sortDirection) => {
+            setFinalPreviewSortDirection(sortDirection);
+            if (finalPreviewRows) void previewPortalFinalRows({ sortDirection });
+          }}
+          onLimitChange={(limit) => {
+            setFinalPreviewRowsLimit(limit);
+            setFinalPreviewRows(null);
+            void previewPortalFinalRows({ limit });
+          }}
+          onCrmCodeChange={setFinalPreviewCrmCode}
+          onCrmCodeBlur={() => setFinalPreviewCrmCode((value) => normalizeCrmInput(value))}
+          onPreview={() => void previewPortalFinalRows()}
+        />
+      )}
     </main>
   );
 }
@@ -2210,4 +2704,42 @@ function sourceViewBadge(viewType: "view" | "materialized") {
 function sourceViewDisplayLabel(option: SourceViewOption | undefined) {
   if (!option) return null;
   return option.ruleName === option.viewName ? option.viewName : `${option.ruleName} (${option.viewName})`;
+}
+
+function buildFinalListingSummaryColumns(baseColumns: typeof FINAL_LISTING_COLUMNS) {
+  return [
+    ...FINAL_LISTING_COLUMNS.map((column) => ({
+      ...column,
+      column_name: finalListingSummaryColumnKey("final", column.column_name),
+      display_name: `Listagem final / ${column.display_name ?? column.column_name}`
+    })),
+    ...baseColumns
+      .filter((column) => column.filter_kind !== "other")
+      .map((column) => ({
+        ...column,
+        column_name: finalListingSummaryColumnKey("base", column.column_name),
+        display_name: `Base / ${column.display_name ?? column.column_name}`
+      }))
+  ];
+}
+
+function finalListingSummaryColumnKey(source: "final" | "base", columnName: string) {
+  return `__${source}_${columnName}`;
+}
+
+function createClientRequestId(scope: string, requestId?: number) {
+  const randomPart =
+    typeof globalThis.crypto?.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return requestId == null ? `${scope}-${randomPart}` : `${scope}-${requestId}-${randomPart}`;
+}
+
+function normalizeCrmInput(value: string) {
+  return value.trim();
+}
+
+function normalizePortalRefreshTime(value: string | null | undefined) {
+  const match = (value?.trim() || "00:00").match(/^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  return match ? `${match[1]}:${match[2]}` : "00:00";
 }

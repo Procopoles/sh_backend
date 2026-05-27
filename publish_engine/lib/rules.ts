@@ -372,7 +372,8 @@ export function buildRuleRowsPreviewQuery(
   publicationPriority: PublicationPriority = DEFAULT_PUBLICATION_PRIORITY,
   finalLimit: number | null = null,
   previewSortColumnKey: string | null = null,
-  previewSortDirection: "asc" | "desc" = "asc"
+  previewSortDirection: "asc" | "desc" = "asc",
+  crmCodeInput: string | null = null
 ) {
   const previewLimit = previewLimitInput === 100 ? 100 : 10;
   const where = active ? buildWhereSql(filters, columns, includeLocked, true) : { whereSql: "false", params: [] };
@@ -385,6 +386,12 @@ export function buildRuleRowsPreviewQuery(
   const previewOrderBySql = sortColumn
     ? `${sortColumn.sql} ${sortDirection} nulls last, b.__preview_rule_order asc`
     : `b.__preview_rule_order ${sortDirection}`;
+  const crmCode = normalizeCrmCodeFilter(crmCodeInput);
+  const hasCrmColumn = columns.some((column) => column.column_name === "codigo_crm" && !sanitizeJsonPath(column.json_path).length);
+  const params = [...where.params];
+  const crmFilterSql = crmCode && hasCrmColumn
+    ? `\nwhere strpos(lower(b.${quoteIdentifier("codigo_crm")}::text), lower($${params.push(crmCode)}::text)) > 0`
+    : "";
 
   return {
     sql: `with final_selection as (
@@ -397,9 +404,10 @@ export function buildRuleRowsPreviewQuery(
 )
 select ${selectParts.join(", ")}
 from final_selection b
+${crmFilterSql}
 order by ${previewOrderBySql}
 limit ${previewLimit}`,
-    params: where.params,
+    params,
     columns: previewColumns.map(({ key, label }) => ({ key, label }))
   };
 }
@@ -680,6 +688,11 @@ function sanitizeJsonValueKind(kind: unknown): ColumnMetadata["filter_kind"] | n
 
 function jsonPathKey(columnName: string, path: string[]) {
   return `${columnName}\u001f${path.join("\u001f")}`;
+}
+
+function normalizeCrmCodeFilter(value: unknown) {
+  if (value == null) return "";
+  return String(value).trim();
 }
 
 function jsonFieldDisplayName(columnName: string, path: string[]) {

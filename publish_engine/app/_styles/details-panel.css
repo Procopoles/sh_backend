@@ -161,6 +161,59 @@
   background: rgba(255, 255, 255, 0.035);
 }
 
+.portal-final-listing-button {
+  align-items: center;
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.2), rgba(52, 211, 153, 0.12)),
+    rgba(15, 23, 42, 0.86);
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 8px;
+  color: var(--text);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 42px minmax(0, 1fr) 22px;
+  min-height: 68px;
+  padding: 12px;
+  text-align: left;
+  width: 100%;
+}
+
+.portal-final-listing-button:hover:not(:disabled),
+.portal-final-listing-button:focus-visible {
+  border-color: rgba(52, 211, 153, 0.5);
+  box-shadow: 0 16px 34px rgba(2, 132, 199, 0.16);
+  transform: translateY(-1px);
+}
+
+.portal-final-listing-button strong,
+.portal-final-listing-button small {
+  display: block;
+}
+
+.portal-final-listing-button strong {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.portal-final-listing-button small {
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.portal-final-listing-icon {
+  align-items: center;
+  background: rgba(34, 211, 238, 0.14);
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 8px;
+  color: #67e8f9;
+  display: inline-flex;
+  height: 42px;
+  justify-content: center;
+  width: 42px;
+}
+
 .toggle-field {
   align-items: center;
   background: rgba(25, 28, 34, 0.92);
@@ -1326,7 +1379,8 @@
 }
 
 .portal-edit-fullscreen .portal-metrics-grid .summary-status,
-.portal-edit-fullscreen .portal-status-toggle {
+.portal-edit-fullscreen .portal-status-toggle,
+.portal-edit-fullscreen .portal-refresh-time-field {
   background: rgba(255, 255, 255, 0.032);
   border-color: rgba(255, 255, 255, 0.08);
   border-radius: 10px;
@@ -1369,6 +1423,36 @@
 
 .portal-edit-fullscreen .portal-status-toggle input:checked + .toggle-switch::after {
   transform: translateX(22px);
+}
+
+.portal-edit-fullscreen .portal-refresh-time-field {
+  display: grid;
+  gap: 7px;
+  grid-column: 1 / -1;
+}
+
+.portal-edit-fullscreen .portal-refresh-time-field span {
+  color: #9ca3af;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.portal-edit-fullscreen .portal-refresh-time-field input {
+  background: rgba(7, 10, 12, 0.56);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #f4f7f8;
+  font-size: 18px;
+  font-weight: 800;
+  min-height: 40px;
+  padding: 8px 10px;
+}
+
+.portal-edit-fullscreen .portal-refresh-time-field input:focus,
+.portal-edit-fullscreen .portal-refresh-time-field input:hover {
+  border-color: rgba(53, 189, 147, 0.55);
+  outline: none;
 }
 
 .portal-edit-fullscreen .portal-editor-divider {

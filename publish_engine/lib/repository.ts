@@ -11,6 +11,7 @@ import {
   DEFAULT_PUBLICATION_PRIORITY,
   RULE_INDEX_COLUMN,
   getBaseColumns,
+  getFilterKind,
   quoteIdentifier,
   quoteLiteral,
   resolveRuleColumnTarget,
@@ -42,6 +43,7 @@ type PortalInput = {
   description?: string | null;
   logo_url?: string | null;
   active?: boolean;
+  final_listing_refresh_time?: string | null;
   ad_types?: PortalAdTypeInput[];
 };
 
@@ -70,16 +72,39 @@ type PreviewRowsInput = RuleInput & {
   limit?: number;
   preview_sort_column?: string | null;
   preview_sort_direction?: "asc" | "desc" | null;
+  crm_code?: string | null;
 };
 
 type RuleSummaryInput = RuleInput & {
   items?: RuleSummaryConfigItem[];
 };
 
+type RuleQueryPreviewInput = RuleInput & {
+  id?: number | string | null;
+  view_name?: string | null;
+};
+
+type PortalFinalPreviewRowsInput = {
+  portal_id?: number | string | null;
+  limit?: number;
+  preview_sort_column?: string | null;
+  preview_sort_direction?: "asc" | "desc" | null;
+  crm_code?: string | null;
+  refresh?: boolean;
+};
+
+type PortalFinalSummaryInput = {
+  portal_id?: number | string | null;
+  items?: RuleSummaryConfigItem[];
+  refresh?: boolean;
+};
+
 const DEFAULT_SUMMARY_GROUP_COUNT = 5;
 const DEFAULT_SUMMARY_VALUE_COUNT_LIMIT = 5;
 const MAX_SUMMARY_ITEMS = 12;
 const DATA_API_COLUMNS_CACHE_MS = 5 * 60 * 1000;
+const PUBLISH_REFRESH_LOCK_NAMESPACE = 748513;
+const PUBLISH_REFRESH_LOCK_KEY = 42017;
 const HEALTHCHECK_REPORT_CACHE_MS = Math.max(
   10_000,
   Number(process.env.HEALTHCHECK_REPORT_CACHE_MS ?? "120000") || 120_000
@@ -97,6 +122,16 @@ const FINAL_VIEW_CURRENT_PUBLICATION_COLUMN = "current_publication";
 const FINAL_VIEW_PUBLISHED_STATUS = "published";
 const FINAL_VIEW_PENDING_STATUS = "pending";
 const FINAL_VIEW_REQUIRED_COLUMNS = ["codigo_crm", "publicacao_portais"];
+const FINAL_SUMMARY_COLUMN_PREFIX = "__final_";
+const BASE_SUMMARY_COLUMN_PREFIX = "__base_";
+const FINAL_VIEW_PREVIEW_COLUMNS = [
+  { key: "codigo_crm", label: "codigo_crm" },
+  { key: FINAL_VIEW_STATUS_COLUMN, label: "Status" },
+  { key: FINAL_VIEW_AD_TYPE_NAME_COLUMN, label: "Tipo de anuncio" },
+  { key: FINAL_VIEW_AD_TYPE_SLUG_COLUMN, label: "Slug do tipo" },
+  { key: FINAL_VIEW_TIER_COLUMN, label: "Tier" },
+  { key: FINAL_VIEW_PUBLICATION_RANK_COLUMN, label: "Ordem" }
+] as const;
 const FINAL_VIEW_RESERVED_COLUMNS = new Set([
   RULE_INDEX_COLUMN,
   "__allocation_rule_order",
@@ -162,17 +197,24 @@ export async function createPortal(input: PortalInput) {
 
   await ensureControlSchema();
   const portal = await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const slug = normalizePortalSlug(input.slug, input.name);
     const result = await client.query<Portal>(
       `
-        insert into publish_portals (name, slug, description, logo_url, active)
-        values ($1, $2, $3, $4, $5)
+        insert into publish_portals (name, slug, description, logo_url, active, final_listing_refresh_time)
+        values ($1, $2, $3, $4, $5, $6::time)
         returning *
       `,
-      [input.name.trim(), slug, input.description ?? null, input.logo_url ?? null, input.active ?? true]
+      [
+        input.name.trim(),
+        slug,
+        input.description ?? null,
+        input.logo_url ?? null,
+        input.active ?? true,
+        normalizePortalRefreshTime(input.final_listing_refresh_time)
+      ]
     );
     await replacePortalAdTypes(client, result.rows[0].id, input.ad_types ?? []);
-    await refreshPortalFinalView(client, result.rows[0].id);
     return getPortalById(client, result.rows[0].id);
   });
   invalidateHealthcheckReportCache();
@@ -184,6 +226,7 @@ export async function updatePortal(id: number, input: PortalInput) {
 
   await ensureControlSchema();
   const portal = await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const existingPortal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [id]);
     const slug = normalizePortalSlug(input.slug, input.name);
     const currentAdTypes = await listPortalAdTypes(client, id);
@@ -191,25 +234,33 @@ export async function updatePortal(id: number, input: PortalInput) {
     const result = await client.query<Portal>(
       `
         update publish_portals
-        set name = $2, slug = $3, description = $4, logo_url = $5, active = $6, updated_at = now()
+        set name = $2,
+            slug = $3,
+            description = $4,
+            logo_url = $5,
+            active = $6,
+            final_listing_refresh_time = $7::time,
+            updated_at = now()
         where id = $1
         returning *
       `,
-      [id, input.name.trim(), slug, input.description ?? null, input.logo_url ?? null, input.active ?? true]
+      [
+        id,
+        input.name.trim(),
+        slug,
+        input.description ?? null,
+        input.logo_url ?? null,
+        input.active ?? true,
+        normalizePortalRefreshTime(input.final_listing_refresh_time)
+      ]
     );
     if (!result.rows[0]) return null;
     if (existingPortal.rows[0]?.slug && existingPortal.rows[0].slug !== slug) {
       await dropPortalFinalViewBySlug(client, existingPortal.rows[0].slug);
     }
     await replacePortalAdTypes(client, id, input.ad_types ?? []);
-    const affectedPortalIds = new Set<number>([id]);
     if (adTypesChanged) {
-      for (const affectedPortalId of await refreshRuleViewsForPortal(client, id)) {
-        affectedPortalIds.add(affectedPortalId);
-      }
-    }
-    for (const affectedPortalId of affectedPortalIds) {
-      await refreshPortalFinalView(client, affectedPortalId);
+      await refreshRuleViewsForPortal(client, id);
     }
     return getPortalById(client, id);
   });
@@ -222,6 +273,7 @@ export async function deletePortal(id: number) {
 
   await ensureControlSchema();
   await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const portal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [id]);
     if (portal.rows[0]?.slug) await dropPortalFinalViewBySlug(client, portal.rows[0].slug);
     await client.query("update publish_rules set portal_id = null, updated_at = now() where portal_id = $1", [id]);
@@ -312,6 +364,7 @@ export async function createRule(input: RuleInput) {
 
   await ensureControlSchema();
   const rule = await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const columns = await getBaseColumns(client);
     const portalId = normalizePortalId(input.portal_id);
     const portal = portalId
@@ -362,7 +415,6 @@ export async function createRule(input: RuleInput) {
       publication_priority: publicationPriority,
       summary_config: summaryConfig
     });
-    if (portalId) await refreshPortalFinalView(client, portalId);
     return refreshed;
   });
   invalidateHealthcheckReportCache();
@@ -374,6 +426,7 @@ export async function updateRule(id: number, input: RuleInput) {
 
   await ensureControlSchema();
   const rule = await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const columns = await getBaseColumns(client);
     const existing = await client.query<PublicationRule>("select * from publish_rules where id = $1", [id]);
     if (!existing.rows[0]) return null;
@@ -448,10 +501,7 @@ export async function updateRule(id: number, input: RuleInput) {
       publication_priority: publicationPriority,
       summary_config: summaryConfig
     });
-    const affectedPortalIds = await refreshDependentRuleViews(client, refreshed.view_name, new Set([id]));
-    for (const affectedPortalId of new Set([...affectedPortalIds, previousPortalId, portalId])) {
-      if (affectedPortalId) await refreshPortalFinalView(client, affectedPortalId);
-    }
+    await refreshDependentRuleViews(client, refreshed.view_name, new Set([id]));
     return refreshed;
   });
   invalidateHealthcheckReportCache();
@@ -463,6 +513,7 @@ export async function updateRuleSummaryConfig(id: number, summaryConfigInput: un
 
   await ensureControlSchema();
   const rule = await withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
     const columns = await getBaseColumns(client);
     const summaryConfig = sanitizeRuleSummaryConfig(summaryConfigInput, columns);
     const result = await client.query<PublicationRule>(
@@ -486,25 +537,19 @@ export async function deleteRule(id: number) {
 
   await ensureControlSchema();
   await withTransaction(async (client) => {
-    const existing = await client.query<{ view_name: string | null; portal_id: number | null; portal_slug: string | null }>(
+    await acquirePublishRefreshLock(client);
+    const existing = await client.query<{ view_name: string | null }>(
       `
-        select r.view_name, r.portal_id, p.slug as portal_slug
+        select r.view_name
         from publish_rules r
-        left join publish_portals p on p.id = r.portal_id
         where r.id = $1
       `,
       [id]
     );
-    if (existing.rows[0]?.portal_slug) {
-      await dropPortalFinalViewBySlug(client, existing.rows[0].portal_slug);
-    }
     if (existing.rows[0]?.view_name) {
       await client.query(`drop view if exists public."${existing.rows[0].view_name.replace(/"/g, '""')}"`);
     }
     await client.query("delete from publish_rules where id = $1", [id]);
-    if (existing.rows[0]?.portal_id) {
-      await refreshPortalFinalView(client, existing.rows[0].portal_id);
-    }
   });
   invalidateHealthcheckReportCache();
 }
@@ -531,6 +576,17 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
   const client = await getPool().connect();
   try {
     await client.query("begin");
+    const lockAcquired = await tryAcquirePublishRefreshLock(client);
+    if (!lockAcquired) {
+      const statuses = await listStoredRuleHealthcheckStatuses(client, ruleId);
+      await client.query("commit");
+      logRepository("info", "healthcheck.skipped-refresh-lock", {
+        ruleId: ruleId ?? null,
+        statusCount: statuses.length
+      });
+      return statuses;
+    }
+
     const result = await client.query<
       Pick<
         PublicationRule,
@@ -547,11 +603,11 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
       ruleId ? [ruleId] : []
     );
 
-    await refreshFinalViewsForHealthcheck(client, result.rows);
+    const portalStatusErrors = await refreshFinalStatusesForHealthcheck(client, result.rows);
 
     const statuses: RuleHealthcheckStatus[] = [];
     for (const rule of result.rows) {
-      statuses.push(await runSingleRuleHealthcheck(client, rule));
+      statuses.push(await runSingleRuleHealthcheck(client, rule, rule.portal_id ? portalStatusErrors.get(rule.portal_id) ?? null : null));
     }
     await client.query("commit");
     invalidateHealthcheckReportCache(ruleId);
@@ -562,6 +618,38 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
   } finally {
     client.release();
   }
+}
+
+async function listStoredRuleHealthcheckStatuses(client: PoolClient, ruleId?: number | null) {
+  const result = await client.query<{
+    rule_id: number;
+    portal_id: number | null;
+    portal_slug: string | null;
+    expected_count: number | null;
+    published_count: number | null;
+    pending_count: number | null;
+    unexpected_count: number | null;
+    checked_at: string | null;
+    error: string | null;
+  }>(
+    `
+      select r.id as rule_id,
+             r.portal_id,
+             p.slug as portal_slug,
+             r.health_expected_count as expected_count,
+             r.health_published_count as published_count,
+             r.health_pending_count as pending_count,
+             r.health_unexpected_count as unexpected_count,
+             r.health_checked_at as checked_at,
+             r.health_error as error
+      from publish_rules r
+      left join publish_portals p on p.id = r.portal_id
+      ${ruleId ? "where r.id = $1" : ""}
+      order by r.updated_at desc, r.id desc
+    `,
+    ruleId ? [ruleId] : []
+  );
+  return result.rows;
 }
 
 export async function getRuleHealthcheckReport(options: { ruleId?: number | null; refresh?: boolean } = {}): Promise<RuleHealthcheckReport> {
@@ -633,15 +721,22 @@ export async function getRuleHealthcheckReport(options: { ruleId?: number | null
   };
 }
 
-async function refreshFinalViewsForHealthcheck(client: PoolClient, rules: Array<Pick<HealthcheckRuleRow, "portal_id">>) {
+async function refreshFinalStatusesForHealthcheck(client: PoolClient, rules: Array<Pick<HealthcheckRuleRow, "portal_id">>) {
   const portalIds = new Set<number>();
   for (const rule of rules) {
     if (rule.portal_id) portalIds.add(rule.portal_id);
   }
 
+  const errors = new Map<number, string | null>();
   for (const portalId of portalIds) {
-    await refreshPortalFinalView(client, portalId);
+    try {
+      await refreshPortalFinalStatuses(client, portalId);
+      errors.set(portalId, null);
+    } catch (error) {
+      errors.set(portalId, error instanceof Error ? error.message : "Erro ao atualizar status da listagem final.");
+    }
   }
+  return errors;
 }
 
 export async function previewRule(input: RuleInput) {
@@ -687,7 +782,8 @@ export async function previewRuleRows(input: PreviewRowsInput) {
       publicationPriority,
       adLimitQuota,
       input.preview_sort_column ?? null,
-      input.preview_sort_direction === "desc" ? "desc" : "asc"
+      input.preview_sort_direction === "desc" ? "desc" : "asc",
+      input.crm_code ?? null
     );
     const result = await client.query<Record<string, unknown>>(preview.sql, preview.params);
     return { columns: preview.columns, rows: result.rows };
@@ -738,6 +834,258 @@ export async function previewRuleSummary(input: RuleSummaryInput): Promise<RuleS
   });
 }
 
+export async function previewRuleQuery(input: RuleQueryPreviewInput) {
+  if (isDataApiConfigured()) return previewRuleQueryViaApi(input);
+
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const columns = await getBaseColumns(client);
+    const filters = sanitizeFilters(input.filters ?? DEFAULT_FILTERS, columns);
+    const publicationPriority = sanitizePublicationPriority(input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+    const ruleId = normalizeOptionalPositiveInteger(input.id);
+    const sourceTable = await validateSourceTable(client, input.source_table, ruleId ?? undefined);
+    const sourceColumns = await listPublishSelectableColumns(client, sourceTable);
+    const selectSql = buildRuleSelectSql(
+      sourceTable,
+      filters,
+      columns,
+      input.include_locked ?? true,
+      input.active ?? true,
+      undefined,
+      publicationPriority,
+      null,
+      sourceColumns,
+      true
+    );
+    const viewName = await resolvePreviewRuleViewName(client, input, ruleId);
+    const viewSql = viewName
+      ? buildViewSql(
+          viewName,
+          sourceTable,
+          filters,
+          columns,
+          input.include_locked ?? true,
+          input.active ?? true,
+          publicationPriority,
+          null,
+          sourceColumns,
+          true
+        )
+      : null;
+
+    return { select_sql: selectSql, view_sql: viewSql, view_name: viewName };
+  });
+}
+
+export async function previewPortalFinalRows(input: PortalFinalPreviewRowsInput) {
+  const startedAt = Date.now();
+  logRepository("info", "portal-final.rows.start", {
+    mode: isDataApiConfigured() ? "data-api" : "direct-db",
+    portalId: input.portal_id ?? null,
+    limit: input.limit ?? null,
+    refresh: Boolean(input.refresh),
+    crmCode: normalizeCrmCodeFilter(input.crm_code) ? "[filtered]" : null
+  });
+  try {
+    const result = isDataApiConfigured()
+      ? await previewPortalFinalRowsViaApi(input)
+      : await previewPortalFinalRowsDirect(input);
+    logRepository("info", "portal-final.rows.ok", {
+      portalId: input.portal_id ?? null,
+      columnCount: result.columns.length,
+      rowCount: result.rows.length,
+      elapsedMs: Date.now() - startedAt
+    });
+    return result;
+  } catch (error) {
+    logRepository("error", "portal-final.rows.error", {
+      portalId: input.portal_id ?? null,
+      elapsedMs: Date.now() - startedAt,
+      error
+    });
+    throw error;
+  }
+}
+
+export async function previewPortalFinalSummary(input: PortalFinalSummaryInput): Promise<RuleSummaryResponse> {
+  const startedAt = Date.now();
+  logRepository("info", "portal-final.summary.start", {
+    mode: isDataApiConfigured() ? "data-api" : "direct-db",
+    portalId: input.portal_id ?? null,
+    itemCount: input.items?.length ?? 0,
+    refresh: Boolean(input.refresh),
+    columns: input.items?.map((item) => item.column) ?? []
+  });
+  try {
+    const result = isDataApiConfigured()
+      ? await previewPortalFinalSummaryViaApi(input)
+      : await previewPortalFinalSummaryDirect(input);
+    logRepository("info", "portal-final.summary.ok", {
+      portalId: input.portal_id ?? null,
+      total: result.total,
+      resultItems: result.items.length,
+      elapsedMs: Date.now() - startedAt
+    });
+    return result;
+  } catch (error) {
+    logRepository("error", "portal-final.summary.error", {
+      portalId: input.portal_id ?? null,
+      elapsedMs: Date.now() - startedAt,
+      error
+    });
+    throw error;
+  }
+}
+
+export async function refreshPortalFinalListing(input: { portalId?: number | string | null } = {}) {
+  const startedAt = Date.now();
+  logRepository("info", "portal-final.listing-refresh.start", {
+    mode: isDataApiConfigured() ? "data-api" : "direct-db",
+    portalId: input.portalId ?? null
+  });
+  try {
+    const result = isDataApiConfigured()
+      ? await refreshPortalFinalListingsViaApi(input)
+      : await refreshPortalFinalListingsDirect(input);
+    logRepository("info", "portal-final.listing-refresh.ok", {
+      portalId: input.portalId ?? null,
+      refreshedCount: result.refreshed.length,
+      elapsedMs: Date.now() - startedAt
+    });
+    return result;
+  } catch (error) {
+    logRepository("error", "portal-final.listing-refresh.error", {
+      portalId: input.portalId ?? null,
+      elapsedMs: Date.now() - startedAt,
+      error
+    });
+    throw error;
+  }
+}
+
+export async function refreshPortalFinalListings(input: { portalId?: number | string | null } = {}) {
+  return refreshPortalFinalListing(input);
+}
+
+export async function refreshScheduledPortalFinalListings(now = new Date()) {
+  const startedAt = Date.now();
+  logRepository("info", "portal-final.scheduled-refresh.start", {
+    mode: isDataApiConfigured() ? "data-api" : "direct-db"
+  });
+  try {
+    const result = isDataApiConfigured()
+      ? await refreshScheduledPortalFinalListingsViaApi(now)
+      : await refreshScheduledPortalFinalListingsDirect(now);
+    logRepository("info", "portal-final.scheduled-refresh.ok", {
+      checkedCount: result.checked,
+      dueCount: result.due,
+      refreshedCount: result.refreshed.length,
+      skipped: result.skipped,
+      elapsedMs: Date.now() - startedAt
+    });
+    return result;
+  } catch (error) {
+    logRepository("error", "portal-final.scheduled-refresh.error", {
+      elapsedMs: Date.now() - startedAt,
+      error
+    });
+    throw error;
+  }
+}
+
+async function previewPortalFinalRowsDirect(input: PortalFinalPreviewRowsInput) {
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const portalId = normalizeRequiredPortalId(input.portal_id);
+    const { viewName } = await ensurePortalFinalViewForRead(client, portalId);
+    return queryPortalFinalRows(client, viewName, input);
+  });
+}
+
+async function previewPortalFinalSummaryDirect(input: PortalFinalSummaryInput): Promise<RuleSummaryResponse> {
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const portalId = normalizeRequiredPortalId(input.portal_id);
+    const { viewName } = await ensurePortalFinalViewForRead(client, portalId);
+    const baseColumns = await getBaseColumns(client);
+    const columns = portalFinalSummaryColumnMetadata(baseColumns);
+    const items = normalizeSummaryItems(input.items, columns);
+    const selectionSql = buildPortalFinalSummarySelectionSql(viewName, summarySelectionColumns(items, columns), columns);
+
+    if (!items.length) {
+      const totalResult = await client.query<{ total: number }>(
+        `select count(*)::int as total from (${selectionSql}) summary_selection`
+      );
+      return { total: totalResult.rows[0]?.total ?? 0, items: [] };
+    }
+
+    const summarySelectionSql = await materializeRuleSummarySelection(client, selectionSql);
+    const totalResult = await client.query<{ total: number }>(
+      `select count(*)::int as total from (${summarySelectionSql}) summary_selection`
+    );
+    const total = totalResult.rows[0]?.total ?? 0;
+    const resultItems: RuleSummaryItemResult[] = [];
+
+    for (const item of items) {
+      resultItems.push(await summarizeRuleItem(client, summarySelectionSql, item, total));
+    }
+
+    return { total, items: resultItems };
+  });
+}
+
+async function refreshPortalFinalListingsDirect(input: { portalId?: number | string | null } = {}) {
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    await acquirePublishRefreshLock(client);
+    const portalId = normalizeOptionalPositiveInteger(input.portalId);
+    const portalIds = portalId ? [portalId] : await listRefreshablePortalIds(client);
+    const refreshed: Array<{ portal_id: number; view_name: string }> = [];
+
+    for (const currentPortalId of portalIds) {
+      const result = await refreshPortalFinalView(client, currentPortalId, "manual");
+      if (result) refreshed.push({ portal_id: currentPortalId, view_name: result.viewName });
+    }
+
+    invalidateHealthcheckReportCache();
+    return { refreshed };
+  });
+}
+
+type ScheduledPortalRow = Pick<Portal, "id" | "slug" | "final_listing_refresh_time" | "final_view_refreshed_at">;
+
+async function refreshScheduledPortalFinalListingsDirect(now: Date) {
+  await ensureControlSchema();
+  return withTransaction(async (client) => {
+    const lockAcquired = await tryAcquirePublishRefreshLock(client);
+    if (!lockAcquired) {
+      return { refreshed: [], checked: 0, due: 0, skipped: true, reason: "refresh-lock" };
+    }
+
+    const result = await client.query<ScheduledPortalRow>(
+      `
+        select id,
+               slug,
+               final_listing_refresh_time::text as final_listing_refresh_time,
+               final_view_refreshed_at
+        from publish_portals
+        where active = true
+        order by name asc, id asc
+      `
+    );
+    const portalIds = result.rows.filter((portal) => shouldRunScheduledPortalRefresh(portal, now)).map((portal) => portal.id);
+    const refreshed: Array<{ portal_id: number; view_name: string }> = [];
+
+    for (const portalId of portalIds) {
+      const refreshResult = await refreshPortalFinalView(client, portalId, "scheduled");
+      if (refreshResult) refreshed.push({ portal_id: portalId, view_name: refreshResult.viewName });
+    }
+
+    invalidateHealthcheckReportCache();
+    return { refreshed, checked: result.rows.length, due: portalIds.length, skipped: false };
+  });
+}
+
 function buildRuleSelectSqlForSummary(
   sourceTable: string,
   filters: RuleFilters,
@@ -765,6 +1113,26 @@ async function materializeRuleSummarySelection(client: PoolClient, selectionSql:
   await client.query("drop table if exists pg_temp.rule_summary_selection");
   await client.query(`create temporary table rule_summary_selection on commit drop as ${selectionSql}`);
   return "select * from rule_summary_selection";
+}
+
+function logRepository(level: "info" | "error", event: string, details: Record<string, unknown>) {
+  const logger = level === "error" ? console.error : console.info;
+  logger(`[publish-engine] repository.${event}`, details);
+}
+
+async function acquirePublishRefreshLock(client: PoolClient) {
+  await client.query("select pg_advisory_xact_lock($1::integer, $2::integer)", [
+    PUBLISH_REFRESH_LOCK_NAMESPACE,
+    PUBLISH_REFRESH_LOCK_KEY
+  ]);
+}
+
+async function tryAcquirePublishRefreshLock(client: PoolClient) {
+  const result = await client.query<{ locked: boolean }>(
+    "select pg_try_advisory_xact_lock($1::integer, $2::integer) as locked",
+    [PUBLISH_REFRESH_LOCK_NAMESPACE, PUBLISH_REFRESH_LOCK_KEY]
+  );
+  return result.rows[0]?.locked ?? false;
 }
 
 type NormalizedRuleSummaryItem = {
@@ -1284,11 +1652,11 @@ async function createPortalViaApi(input: PortalInput) {
       slug,
       description: input.description ?? null,
       logo_url: input.logo_url ?? null,
-      active: input.active ?? true
+      active: input.active ?? true,
+      final_listing_refresh_time: normalizePortalRefreshTime(input.final_listing_refresh_time)
     }
   });
   await replacePortalAdTypesViaApi(rows[0].id, input.ad_types ?? []);
-  await refreshPortalFinalViewViaApi(rows[0].id);
   const portal = await getPortalByIdViaApi(rows[0].id);
   invalidateHealthcheckReportCache();
   return portal;
@@ -1310,6 +1678,7 @@ async function updatePortalViaApi(id: number, input: PortalInput) {
       description: input.description ?? null,
       logo_url: input.logo_url ?? null,
       active: input.active ?? true,
+      final_listing_refresh_time: normalizePortalRefreshTime(input.final_listing_refresh_time),
       updated_at: new Date().toISOString()
     }
   });
@@ -1318,14 +1687,8 @@ async function updatePortalViaApi(id: number, input: PortalInput) {
     await dropPortalFinalViewViaApi(currentPortal[0].slug);
   }
   await replacePortalAdTypesViaApi(id, input.ad_types ?? []);
-  const affectedPortalIds = new Set<number>([id]);
   if (adTypesChanged) {
-    for (const affectedPortalId of await refreshRuleViewsForPortalViaApi(id)) {
-      affectedPortalIds.add(affectedPortalId);
-    }
-  }
-  for (const affectedPortalId of affectedPortalIds) {
-    await refreshPortalFinalViewViaApi(affectedPortalId);
+    await refreshRuleViewsForPortalViaApi(id);
   }
   const portal = await getPortalByIdViaApi(id);
   invalidateHealthcheckReportCache();
@@ -1390,7 +1753,6 @@ async function createRuleViaApi(input: RuleInput) {
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", {
     rule_id: inserted[0].id
   });
-  if (portalId) await refreshPortalFinalViewViaApi(portalId);
   invalidateHealthcheckReportCache();
   return refreshed[0];
 }
@@ -1440,10 +1802,7 @@ async function updateRuleViaApi(id: number, input: RuleInput) {
 
   if (!updated[0]) return null;
   const refreshed = await dataApiRpc<PublicationRule[]>("refresh_publish_rule_view", { rule_id: id });
-  const affectedPortalIds = await refreshDependentRuleViewsViaApi(refreshed[0]?.view_name ?? null, new Set([id]));
-  for (const affectedPortalId of new Set([...affectedPortalIds, previousPortalId, portalId])) {
-    if (affectedPortalId) await refreshPortalFinalViewViaApi(affectedPortalId);
-  }
+  await refreshDependentRuleViewsViaApi(refreshed[0]?.view_name ?? null, new Set([id]));
   invalidateHealthcheckReportCache();
   return refreshed[0];
 }
@@ -1464,14 +1823,8 @@ async function updateRuleSummaryConfigViaApi(id: number, summaryConfigInput: unk
 }
 
 async function deleteRuleViaApi(id: number) {
-  const existing = await dataApiRequest<Array<Pick<PublicationRule, "portal_id">>>(`/publish_rules?id=eq.${id}&select=portal_id&limit=1`);
-  const existingPortal = existing[0]?.portal_id
-    ? await dataApiRequest<Array<Pick<Portal, "slug">>>(`/publish_portals?id=eq.${existing[0].portal_id}&select=slug&limit=1`)
-    : [];
-  if (existingPortal[0]?.slug) await dropPortalFinalViewViaApi(existingPortal[0].slug);
   await dataApiRpc<PublicationRule[]>("drop_publish_rule_view", { rule_id: id });
   await dataApiRequest(`/publish_rules?id=eq.${id}`, { method: "DELETE" });
-  if (existing[0]?.portal_id) await refreshPortalFinalViewViaApi(existing[0].portal_id);
   invalidateHealthcheckReportCache();
 }
 
@@ -1556,7 +1909,8 @@ async function previewRuleRowsViaApi(input: PreviewRowsInput) {
     active: input.active ?? true,
     preview_limit: input.limit === 100 ? 100 : 10,
     preview_sort_column: input.preview_sort_column ?? null,
-    preview_sort_direction: input.preview_sort_direction === "desc" ? "desc" : "asc"
+    preview_sort_direction: input.preview_sort_direction === "desc" ? "desc" : "asc",
+    crm_code: normalizeCrmCodeFilter(input.crm_code)
   });
 }
 
@@ -1575,6 +1929,75 @@ async function previewRuleSummaryViaApi(_input: RuleSummaryInput): Promise<RuleS
     include_locked: _input.include_locked ?? true,
     active: _input.active ?? true,
     items: Array.isArray(_input.items) ? _input.items : []
+  });
+}
+
+async function previewRuleQueryViaApi(input: RuleQueryPreviewInput) {
+  const columns = await listBaseColumnsViaApi();
+  const filters = sanitizeFilters(input.filters ?? DEFAULT_FILTERS, columns);
+  const publicationPriority = sanitizePublicationPriority(input.publication_priority ?? DEFAULT_PUBLICATION_PRIORITY, columns);
+  const ruleId = normalizeOptionalPositiveInteger(input.id);
+  const sourceTable = await validateSourceTableViaApi(input.source_table, ruleId ?? undefined);
+  const selectSql = buildRuleSelectSql(
+    sourceTable,
+    filters,
+    columns,
+    input.include_locked ?? true,
+    input.active ?? true,
+    undefined,
+    publicationPriority,
+    null,
+    undefined,
+    true
+  );
+  const viewName = await resolvePreviewRuleViewNameViaApi(input, ruleId);
+  const viewSql = viewName
+    ? buildViewSql(
+        viewName,
+        sourceTable,
+        filters,
+        columns,
+        input.include_locked ?? true,
+        input.active ?? true,
+        publicationPriority,
+        null,
+        undefined,
+        true
+      )
+    : null;
+
+  return { select_sql: selectSql, view_sql: viewSql, view_name: viewName };
+}
+
+async function previewPortalFinalRowsViaApi(input: PortalFinalPreviewRowsInput) {
+  const portalId = normalizeRequiredPortalId(input.portal_id);
+  const portal = await ensurePortalFinalViewForReadViaApi(portalId);
+  const viewName = portalFinalViewName(portal.slug);
+  const previewLimit = input.limit === 100 ? 100 : 10;
+  const sortDirection = input.preview_sort_direction === "desc" ? "desc" : "asc";
+  const sortColumn = FINAL_VIEW_PREVIEW_COLUMNS.find((column) => column.key === input.preview_sort_column);
+  const order = sortColumn
+    ? `${sortColumn.key}.${sortDirection}.nullslast,${FINAL_VIEW_PUBLICATION_RANK_COLUMN}.asc.nullslast,${FINAL_VIEW_TIER_COLUMN}.desc.nullslast,codigo_crm.asc`
+    : `${FINAL_VIEW_PUBLICATION_RANK_COLUMN}.asc.nullslast,${FINAL_VIEW_TIER_COLUMN}.desc.nullslast,codigo_crm.asc`;
+  const crmCode = normalizeCrmCodeFilter(input.crm_code);
+  const crmFilter = crmCode ? `&codigo_crm=ilike.*${encodeURIComponent(escapePostgrestLikeValue(crmCode))}*` : "";
+  const columns = FINAL_VIEW_PREVIEW_COLUMNS.map((column) => column.key).join(",");
+  const rows = await dataApiRequest<Array<Record<string, unknown>>>(
+    `/${encodeURIComponent(viewName)}?select=${columns}&order=${encodeURIComponent(order)}&limit=${previewLimit}${crmFilter}`
+  );
+
+  return {
+    columns: FINAL_VIEW_PREVIEW_COLUMNS.map((column) => ({ key: column.key, label: column.label })),
+    rows
+  };
+}
+
+async function previewPortalFinalSummaryViaApi(input: PortalFinalSummaryInput): Promise<RuleSummaryResponse> {
+  const portalId = normalizeRequiredPortalId(input.portal_id);
+  await ensurePortalFinalViewForReadViaApi(portalId);
+  return dataApiRpc<RuleSummaryResponse>("preview_publish_portal_final_summary", {
+    portal_id: portalId,
+    items: Array.isArray(input.items) ? input.items : []
   });
 }
 
@@ -1786,7 +2209,64 @@ async function refreshRuleViewsBySeedIdsViaApi(seedIds: number[], rules: Publica
 }
 
 async function refreshPortalFinalViewViaApi(portalId: number) {
-  await dataApiRpc<{ view_name: string }[]>("refresh_publish_portal_final_view", { portal_id: portalId });
+  await dataApiRpc<{ view_name: string }[]>("refresh_publish_portal_final_listing", {
+    target_portal_id: portalId,
+    refresh_reason: "manual"
+  });
+}
+
+async function refreshPortalFinalListingsViaApi(input: { portalId?: number | string | null } = {}) {
+  const portalId = normalizeOptionalPositiveInteger(input.portalId);
+  const portalIds = portalId
+    ? [portalId]
+    : (await dataApiRequest<Array<Pick<Portal, "id">>>("/publish_portals?select=id&order=name.asc,id.asc")).map((portal) => portal.id);
+  const refreshed: Array<{ portal_id: number; view_name: string }> = [];
+
+  for (const currentPortalId of portalIds) {
+    const result = await dataApiRpc<Array<{ view_name: string }>>("refresh_publish_portal_final_listing", {
+      target_portal_id: currentPortalId,
+      refresh_reason: "manual"
+    });
+    if (result[0]?.view_name) refreshed.push({ portal_id: currentPortalId, view_name: result[0].view_name });
+  }
+
+  invalidateHealthcheckReportCache();
+  return { refreshed };
+}
+
+async function refreshScheduledPortalFinalListingsViaApi(now: Date) {
+  const portals = await dataApiRequest<ScheduledPortalRow[]>(
+    "/publish_portals?active=eq.true&select=id,slug,final_listing_refresh_time,final_view_refreshed_at&order=name.asc,id.asc"
+  );
+  const duePortals = portals.filter((portal) => shouldRunScheduledPortalRefresh(portal, now));
+  const refreshed: Array<{ portal_id: number; view_name: string }> = [];
+
+  for (const portal of duePortals) {
+    const result = await dataApiRpc<Array<{ view_name: string }>>("refresh_publish_portal_final_listing", {
+      target_portal_id: portal.id,
+      refresh_reason: "scheduled"
+    });
+    if (result[0]?.view_name) refreshed.push({ portal_id: portal.id, view_name: result[0].view_name });
+  }
+
+  invalidateHealthcheckReportCache();
+  return { refreshed, checked: portals.length, due: duePortals.length, skipped: false };
+}
+
+async function ensurePortalFinalViewForReadViaApi(portalId: number) {
+  const portals = await dataApiRequest<Array<Pick<Portal, "id" | "slug" | "final_view_refreshed_at">>>(
+    `/publish_portals?id=eq.${portalId}&select=id,slug,final_view_refreshed_at&limit=1`
+  );
+  const portal = portals[0];
+  if (!portal?.slug) throw new Error("Portal nao encontrado.");
+
+  const viewName = portalFinalViewName(portal.slug);
+  try {
+    await dataApiRequest(`/${encodeURIComponent(viewName)}?select=codigo_crm&limit=0`);
+  } catch {
+    throw new Error("Listagem final ainda nao existe. Use Atualizar listagem para gerar a listagem completa.");
+  }
+  return portal;
 }
 
 async function dropPortalFinalViewViaApi(portalSlug: string) {
@@ -1877,6 +2357,45 @@ function normalizeSourceTable(sourceTable?: string | null) {
   return source;
 }
 
+async function resolvePreviewRuleViewName(
+  client: PoolClient,
+  input: RuleQueryPreviewInput,
+  ruleId: number | null
+) {
+  const providedViewName = input.view_name?.trim();
+  if (providedViewName) {
+    assertRuleViewName(providedViewName);
+    return providedViewName;
+  }
+  if (!ruleId) return null;
+
+  const result = await client.query<Pick<PublicationRule, "view_name">>(
+    "select view_name from publish_rules where id = $1",
+    [ruleId]
+  );
+  const viewName = result.rows[0]?.view_name?.trim();
+  if (!viewName) return null;
+  assertRuleViewName(viewName);
+  return viewName;
+}
+
+async function resolvePreviewRuleViewNameViaApi(input: RuleQueryPreviewInput, ruleId: number | null) {
+  const providedViewName = input.view_name?.trim();
+  if (providedViewName) {
+    assertRuleViewName(providedViewName);
+    return providedViewName;
+  }
+  if (!ruleId) return null;
+
+  const result = await dataApiRequest<Array<Pick<PublicationRule, "view_name">>>(
+    `/publish_rules?id=eq.${ruleId}&select=view_name&limit=1`
+  );
+  const viewName = result[0]?.view_name?.trim();
+  if (!viewName) return null;
+  assertRuleViewName(viewName);
+  return viewName;
+}
+
 function normalizePortalId(portalId?: number | string | null) {
   if (portalId == null || portalId === "") return null;
   const normalized = Number(portalId);
@@ -1898,6 +2417,56 @@ function normalizePortalSlug(slug: string | null | undefined, fallbackName: stri
     throw new Error("Slug do portal deve usar apenas letras minusculas, numeros e underscore.");
   }
   return normalized;
+}
+
+function normalizePortalRefreshTime(value: string | null | undefined) {
+  const normalized = value?.trim() || "00:00";
+  const match = normalized.match(/^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  if (!match) throw new Error("Horario de atualização da listagem invalido.");
+  return `${match[1]}:${match[2]}`;
+}
+
+function shouldRunScheduledPortalRefresh(portal: ScheduledPortalRow, now: Date) {
+  const currentLocal = saoPauloDateTimeParts(now);
+  const scheduledMinutes = timeToMinutes(portal.final_listing_refresh_time);
+  const currentMinutes = timeToMinutes(`${currentLocal.hour}:${currentLocal.minute}`);
+  if (currentMinutes < scheduledMinutes) return false;
+
+  const refreshedAt = portal.final_view_refreshed_at ? new Date(portal.final_view_refreshed_at) : null;
+  if (!refreshedAt || Number.isNaN(refreshedAt.getTime())) return true;
+
+  const refreshedLocal = saoPauloDateTimeParts(refreshedAt);
+  const refreshedDate = `${refreshedLocal.year}-${refreshedLocal.month}-${refreshedLocal.day}`;
+  const currentDate = `${currentLocal.year}-${currentLocal.month}-${currentLocal.day}`;
+  if (refreshedDate !== currentDate) return true;
+
+  return timeToMinutes(`${refreshedLocal.hour}:${refreshedLocal.minute}`) < scheduledMinutes;
+}
+
+function saoPauloDateTimeParts(value: Date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(value);
+  const lookup = new Map(parts.map((part) => [part.type, part.value]));
+  return {
+    year: lookup.get("year") ?? "1970",
+    month: lookup.get("month") ?? "01",
+    day: lookup.get("day") ?? "01",
+    hour: lookup.get("hour") ?? "00",
+    minute: lookup.get("minute") ?? "00"
+  };
+}
+
+function timeToMinutes(value: string) {
+  const normalized = normalizePortalRefreshTime(value);
+  const [hour, minute] = normalized.split(":").map(Number);
+  return hour * 60 + minute;
 }
 
 function normalizeAdLimitType(adLimitType?: string | null) {
@@ -2123,10 +2692,238 @@ type PortalFinalAdType = {
   quantity: number;
 };
 
+type PortalFinalReadPortal = Pick<Portal, "id" | "slug"> & {
+  final_view_refreshed_at: string | Date | null;
+};
+
+async function listRefreshablePortalIds(client: PoolClient) {
+  const result = await client.query<{ id: number }>("select id from publish_portals order by name asc, id asc");
+  return result.rows.map((row) => row.id);
+}
+
+async function ensurePortalFinalViewForRead(
+  client: PoolClient,
+  portalId: number
+) {
+  const portal = await client.query<PortalFinalReadPortal>(
+    "select id, slug, final_view_refreshed_at from publish_portals where id = $1",
+    [portalId]
+  );
+  const portalRow = portal.rows[0];
+  if (!portalRow?.slug) throw new Error("Portal nao encontrado.");
+
+  const viewName = portalFinalViewName(portalRow.slug);
+  const relationKind = await portalFinalRelationKind(client, viewName);
+  if (!relationKind) {
+    throw new Error("Listagem final ainda nao existe. Use Atualizar listagem para gerar a listagem completa.");
+  }
+
+  return { portal: portalRow, viewName };
+}
+
+async function portalFinalRelationKind(client: PoolClient, viewName: string) {
+  const result = await client.query<{ relkind: string }>(
+    `
+      select c.relkind
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public'
+        and c.relkind in ('r', 'v', 'm')
+        and c.relname = $1
+      limit 1
+    `,
+    [viewName]
+  );
+  return result.rows[0]?.relkind ?? null;
+}
+
+async function portalFinalRelationExists(client: PoolClient, viewName: string) {
+  return Boolean(await portalFinalRelationKind(client, viewName));
+}
+
+async function refreshPortalFinalStatuses(client: PoolClient, portalId: number) {
+  await acquirePublishRefreshLock(client);
+  const portal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [portalId]);
+  const portalSlug = portal.rows[0]?.slug;
+  if (!portalSlug) throw new Error("Portal nao encontrado.");
+
+  const viewName = portalFinalViewName(portalSlug);
+  const relationKind = await portalFinalRelationKind(client, viewName);
+  if (!relationKind) {
+    throw new Error("Listagem final ainda nao existe. Use Atualizar listagem para gerar a listagem completa.");
+  }
+  if (relationKind !== "r") {
+    throw new Error("Listagem final precisa ser atualizada completamente antes da atualização de status.");
+  }
+
+  const columns = await listRelationColumns(client, viewName);
+  const missingColumns = [
+    "codigo_crm",
+    FINAL_VIEW_AD_TYPE_SLUG_COLUMN,
+    FINAL_VIEW_STATUS_COLUMN,
+    FINAL_VIEW_CURRENT_PUBLICATION_COLUMN
+  ].filter((column) => !columns.includes(column));
+  if (missingColumns.length) {
+    throw new Error(`Listagem final sem ${missingColumns.join(", ")}.`);
+  }
+
+  const result = await client.query(
+    `
+      update public.${quoteIdentifier(viewName)} final
+      set ${quoteIdentifier(FINAL_VIEW_CURRENT_PUBLICATION_COLUMN)} = b.${quoteIdentifier("publicacao_portais")}::jsonb,
+          ${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)} = case
+            when ${portalPublishedFromSql(`b.${quoteIdentifier("publicacao_portais")}::jsonb`, portalSlug)}
+             and ${portalPublicationTypeSlugFromSql(`b.${quoteIdentifier("publicacao_portais")}::jsonb`, portalSlug)} = final.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}
+            then ${quoteLiteral(FINAL_VIEW_PUBLISHED_STATUS)}::text
+            else ${quoteLiteral(FINAL_VIEW_PENDING_STATUS)}::text
+          end
+      from public.base_imoveis b
+      where b.${quoteIdentifier("codigo_crm")} = final.${quoteIdentifier("codigo_crm")}
+    `
+  );
+  return { portal_id: portalId, view_name: viewName, updated_count: result.rowCount ?? 0 };
+}
+
+async function queryPortalFinalRows(
+  client: PoolClient,
+  viewName: string,
+  input: PortalFinalPreviewRowsInput
+) {
+  const previewLimit = input.limit === 100 ? 100 : 10;
+  const sortDirection = input.preview_sort_direction === "desc" ? "desc" : "asc";
+  const sortColumn = FINAL_VIEW_PREVIEW_COLUMNS.find((column) => column.key === input.preview_sort_column);
+  const defaultOrderSql = [
+    `b.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)} asc nulls last`,
+    `b.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc nulls last`,
+    `b.${quoteIdentifier("codigo_crm")} asc`
+  ].join(", ");
+  const orderSql = sortColumn
+    ? `b.${quoteIdentifier(sortColumn.key)} ${sortDirection} nulls last, ${defaultOrderSql}`
+    : defaultOrderSql;
+  const selectSql = FINAL_VIEW_PREVIEW_COLUMNS
+    .map((column) => `b.${quoteIdentifier(column.key)} as ${quoteIdentifier(column.key)}`)
+    .join(", ");
+  const params: unknown[] = [];
+  const crmCode = normalizeCrmCodeFilter(input.crm_code);
+  const whereSql = crmCode
+    ? `where strpos(lower(b.${quoteIdentifier("codigo_crm")}::text), lower($1::text)) > 0`
+    : "";
+  if (crmCode) params.push(crmCode);
+
+  const result = await client.query<Record<string, unknown>>(
+    `
+      select ${selectSql}
+      from public.${quoteIdentifier(viewName)} b
+      ${whereSql}
+      order by ${orderSql}
+      limit ${previewLimit}
+    `,
+    params
+  );
+
+  return {
+    columns: FINAL_VIEW_PREVIEW_COLUMNS.map((column) => ({ key: column.key, label: column.label })),
+    rows: result.rows
+  };
+}
+
+function portalFinalSummaryColumnMetadata(baseColumns: ColumnMetadata[] = []): ColumnMetadata[] {
+  const columns: Array<Pick<ColumnMetadata, "column_name" | "data_type" | "udt_name" | "display_name">> = [
+    { column_name: "codigo_crm", data_type: "text", udt_name: "text", display_name: "Codigo CRM" },
+    { column_name: FINAL_VIEW_STATUS_COLUMN, data_type: "text", udt_name: "text", display_name: "Status" },
+    { column_name: FINAL_VIEW_AD_TYPE_NAME_COLUMN, data_type: "text", udt_name: "text", display_name: "Tipo de anuncio" },
+    { column_name: FINAL_VIEW_AD_TYPE_SLUG_COLUMN, data_type: "text", udt_name: "text", display_name: "Slug do tipo" },
+    { column_name: FINAL_VIEW_TIER_COLUMN, data_type: "integer", udt_name: "int4", display_name: "Tier" },
+    { column_name: FINAL_VIEW_PUBLICATION_RANK_COLUMN, data_type: "integer", udt_name: "int4", display_name: "Ordem" },
+    { column_name: FINAL_VIEW_CURRENT_PUBLICATION_COLUMN, data_type: "jsonb", udt_name: "jsonb", display_name: "Publicacao atual" }
+  ];
+
+  return [
+    ...columns.map((column) => ({
+      ...column,
+      column_name: portalFinalSummaryColumnKey("final", column.column_name),
+      display_name: `Listagem final / ${column.display_name ?? column.column_name}`,
+      is_nullable: "YES" as const,
+      filter_kind: getFilterKind(column.data_type),
+      json_path: null
+    })),
+    ...baseColumns
+      .filter((column) => column.filter_kind !== "other")
+      .map((column) => ({
+        ...column,
+        column_name: portalFinalSummaryColumnKey("base", column.column_name),
+        display_name: `Base / ${column.display_name ?? column.column_name}`
+      }))
+  ];
+}
+
+function buildPortalFinalSummarySelectionSql(viewName: string, selectedColumns: string[], columns: ColumnMetadata[]) {
+  const columnLookup = new Map(columns.map((column) => [column.column_name, column]));
+  const columnsToSelect = selectedColumns.length
+    ? selectedColumns
+    : [portalFinalSummaryColumnKey("final", "codigo_crm")];
+  const selectParts: string[] = [];
+  const seen = new Set<string>();
+
+  for (const columnName of columnsToSelect) {
+    const column = columnLookup.get(columnName);
+    if (!column || seen.has(column.column_name)) continue;
+
+    const source = portalFinalSummaryColumnSource(column.column_name);
+    if (!source) continue;
+
+    const actualColumn = portalFinalSummaryActualColumnName(column.column_name, source);
+    const alias = source === "final" ? "final_listing" : "base";
+    selectParts.push(`${quoteIdentifier(alias)}.${quoteIdentifier(actualColumn)} as ${quoteIdentifier(column.column_name)}`);
+    seen.add(column.column_name);
+  }
+
+  if (!selectParts.length) {
+    selectParts.push(
+      `${quoteIdentifier("final_listing")}.${quoteIdentifier("codigo_crm")} as ${quoteIdentifier(portalFinalSummaryColumnKey("final", "codigo_crm"))}`
+    );
+  }
+
+  return `select ${selectParts.join(", ")}
+from public.${quoteIdentifier(viewName)} ${quoteIdentifier("final_listing")}
+left join public.base_imoveis ${quoteIdentifier("base")}
+  on ${quoteIdentifier("base")}.${quoteIdentifier("codigo_crm")} = ${quoteIdentifier("final_listing")}.${quoteIdentifier("codigo_crm")}`;
+}
+
+function portalFinalSummaryColumnKey(source: "final" | "base", columnName: string) {
+  return `${source === "final" ? FINAL_SUMMARY_COLUMN_PREFIX : BASE_SUMMARY_COLUMN_PREFIX}${columnName}`;
+}
+
+function portalFinalSummaryColumnSource(columnName: string): "final" | "base" | null {
+  if (columnName.startsWith(FINAL_SUMMARY_COLUMN_PREFIX)) return "final";
+  if (columnName.startsWith(BASE_SUMMARY_COLUMN_PREFIX)) return "base";
+  return null;
+}
+
+function portalFinalSummaryActualColumnName(columnName: string, source: "final" | "base") {
+  const prefix = source === "final" ? FINAL_SUMMARY_COLUMN_PREFIX : BASE_SUMMARY_COLUMN_PREFIX;
+  return columnName.slice(prefix.length);
+}
+
+function normalizeCrmCodeFilter(value: unknown) {
+  if (value == null) return "";
+  return String(value).trim();
+}
+
+function escapePostgrestLikeValue(value: string) {
+  return value.replace(/([%_*])/g, "\\$1");
+}
+
+function normalizeRequiredPortalId(value?: number | string | null) {
+  const portalId = normalizeOptionalPositiveInteger(value);
+  if (!portalId) throw new Error("Portal invalido.");
+  return portalId;
+}
+
 function portalFinalViewName(portalSlug: string) {
   const viewName = `pc_${portalSlug}_final`;
   if (!/^pc_[a-z0-9_]+_final$/.test(viewName) || viewName.length > 63) {
-    throw new Error(`Nome de view final invalido: ${viewName}`);
+    throw new Error(`Nome de listagem final invalido: ${viewName}`);
   }
   return viewName;
 }
@@ -2144,7 +2941,7 @@ async function dropPortalFinalRelation(client: PoolClient, relationName: string)
       join pg_namespace n on n.oid = c.relnamespace
       where n.nspname = 'public'
         and c.relname = $1
-        and c.relkind in ('v', 'm')
+        and c.relkind in ('r', 'v', 'm')
       limit 1
     `,
     [relationName]
@@ -2154,6 +2951,8 @@ async function dropPortalFinalRelation(client: PoolClient, relationName: string)
     await client.query(`drop materialized view if exists public.${quoteIdentifier(relationName)}`);
   } else if (relkind === "v") {
     await client.query(`drop view if exists public.${quoteIdentifier(relationName)}`);
+  } else if (relkind === "r") {
+    await client.query(`drop table if exists public.${quoteIdentifier(relationName)}`);
   }
 }
 
@@ -2265,7 +3064,7 @@ function quotedColumnList(columns: string[], alias?: string) {
 
 function buildEmptyPortalFinalViewSql(viewName: string, columns: string[]) {
   const outputColumns = portalFinalOutputColumns(columns);
-  return `create materialized view public.${quoteIdentifier(viewName)} as
+  return `create table public.${quoteIdentifier(viewName)} as
 select ${quotedColumnList(outputColumns, "b")},
   null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
   null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
@@ -2338,7 +3137,7 @@ function buildPortalFinalViewSql(
   columns: string[]
 ) {
   if (!candidateRules.length || !adTypes.length) {
-    return `create materialized view public.${quoteIdentifier(viewName)} as
+    return `create table public.${quoteIdentifier(viewName)} as
 with ad_types(${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}, quantity) as (
   ${portalFinalAdTypesCteSql(adTypes)}
 ),
@@ -2395,7 +3194,7 @@ where b.codigo_crm is not null`;
     allocatedNames.push(cteName);
   }
 
-  return `create materialized view public.${quoteIdentifier(viewName)} as
+  return `create table public.${quoteIdentifier(viewName)} as
 with ad_types(${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}, quantity) as (
   ${portalFinalAdTypesCteSql(adTypes)}
 ),
@@ -2491,7 +3290,8 @@ async function createPortalFinalIndexes(client: PoolClient, viewName: string, co
   await client.query(`grant select on public.${quoteIdentifier(viewName)} to service_role`);
 }
 
-async function refreshPortalFinalView(client: PoolClient, portalId: number) {
+async function refreshPortalFinalView(client: PoolClient, portalId: number, reason = "change") {
+  await acquirePublishRefreshLock(client);
   const portal = await client.query<Pick<Portal, "slug">>("select slug from publish_portals where id = $1", [portalId]);
   if (!portal.rows[0]?.slug) return null;
 
@@ -2512,6 +3312,10 @@ async function refreshPortalFinalView(client: PoolClient, portalId: number) {
   await dropPortalFinalRelation(client, viewName);
   await client.query(sql);
   await createPortalFinalIndexes(client, viewName, columns);
+  await client.query(
+    "update publish_portals set final_view_refreshed_at = now(), final_view_refresh_reason = $2 where id = $1",
+    [portalId, reason]
+  );
   return { viewName, sql };
 }
 
@@ -2682,7 +3486,11 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRuleRow): Promise<RuleHealthcheckStatus> {
+async function runSingleRuleHealthcheck(
+  client: PoolClient,
+  rule: HealthcheckRuleRow,
+  portalStatusError: string | null = null
+): Promise<RuleHealthcheckStatus> {
   const checkedAt = new Date().toISOString();
 
   try {
@@ -2691,6 +3499,9 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
     }
 
     const finalViewName = portalFinalViewName(rule.portal_slug);
+    if (portalStatusError) {
+      return updateRuleHealthcheckStatus(client, rule, null, null, null, null, checkedAt, portalStatusError);
+    }
 
     const viewExists = await client.query<{ exists: boolean }>(
       `
@@ -2699,14 +3510,14 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
           from pg_class c
           join pg_namespace n on n.oid = c.relnamespace
           where n.nspname = 'public'
-            and c.relkind in ('v', 'm')
+            and c.relkind in ('r', 'v', 'm')
             and c.relname = $1
         ) as exists
       `,
       [finalViewName]
     );
     if (!viewExists.rows[0]?.exists) {
-      return updateRuleHealthcheckStatus(client, rule, null, null, null, null, checkedAt, "View final do portal nao encontrada.");
+      return updateRuleHealthcheckStatus(client, rule, null, null, null, null, checkedAt, "Listagem final do portal nao encontrada.");
     }
 
     const finalViewReady = await client.query<{ ready: boolean }>(
@@ -2719,8 +3530,8 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
             from pg_class c
             join pg_namespace n on n.oid = c.relnamespace
             join pg_attribute a on a.attrelid = c.oid
-            where n.nspname = 'public'
-              and c.relkind in ('v', 'm')
+              where n.nspname = 'public'
+              and c.relkind in ('r', 'v', 'm')
               and c.relname = $1
               and a.attnum > 0
               and not a.attisdropped
@@ -2745,7 +3556,7 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
         null,
         null,
         checkedAt,
-        "View final do portal sem codigo_crm, ad_type_slug, publication_rank, status ou current_publication."
+        "Listagem final do portal sem codigo_crm, ad_type_slug, publication_rank, status ou current_publication."
       );
     }
 
@@ -2854,7 +3665,9 @@ async function refreshRuleView(
     "portal_id" | "filters" | "source_table" | "active" | "include_locked" | "use_ad_limit" | "ad_limit_type" | "publication_priority" | "summary_config"
   >
 ) {
+  await acquirePublishRefreshLock(client);
   const targetViewName = viewName ?? `pc_rule_${id}`;
+  assertRuleViewName(targetViewName);
   const columns = await getBaseColumns(client);
   const sourceColumns = await listPublishSelectableColumns(client, rule.source_table);
   const sql = buildViewSql(
@@ -2869,7 +3682,7 @@ async function refreshRuleView(
     sourceColumns,
     true
   );
-  await client.query(sql);
+  await createOrRecreateRuleView(client, targetViewName, sql);
 
   const countSql = buildWhereSql(rule.filters, columns, rule.include_locked, true);
   const count = await client.query<{ count: number }>(
@@ -2890,4 +3703,42 @@ async function refreshRuleView(
   );
 
   return result.rows[0];
+}
+
+function assertRuleViewName(viewName: string) {
+  if (!/^pc_[a-z0-9_]+$/.test(viewName) || viewName.length > 63) {
+    throw new Error(`Nome de view de regra invalido: ${viewName}`);
+  }
+}
+
+async function createOrRecreateRuleView(client: PoolClient, viewName: string, sql: string) {
+  await client.query("savepoint refresh_rule_view_replace");
+  try {
+    await client.query(sql);
+    await client.query("release savepoint refresh_rule_view_replace");
+    return;
+  } catch (error) {
+    await client.query("rollback to savepoint refresh_rule_view_replace");
+    await client.query("release savepoint refresh_rule_view_replace");
+
+    if (!shouldRecreateRuleView(error)) throw error;
+
+    logRepository("info", "rule-view.recreate-required", {
+      viewName,
+      reason: error instanceof Error ? error.message : String(error)
+    });
+    await client.query(`drop view if exists public.${quoteIdentifier(viewName)} cascade`);
+    await client.query(sql);
+  }
+}
+
+function shouldRecreateRuleView(error: unknown) {
+  const candidate = error as { code?: string; message?: string } | null;
+  const message = candidate?.message ?? "";
+  return (
+    candidate?.code === "42P16" ||
+    /cannot drop columns from view/i.test(message) ||
+    /cannot change name of view column/i.test(message) ||
+    /cannot change data type of view column/i.test(message)
+  );
 }
