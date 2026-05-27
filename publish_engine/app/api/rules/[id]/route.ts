@@ -3,6 +3,7 @@ import { apiErrorResponse } from "@/lib/api-monitoring";
 import { deleteRule, updateRule, updateRuleSummaryConfig } from "@/lib/repository";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 type Context = { params: Promise<{ id: string }> };
 

@@ -705,6 +705,7 @@ export async function previewRuleSummary(input: RuleSummaryInput): Promise<RuleS
     const sourceTable = await validateSourceTable(client, input.source_table);
     const portalId = normalizePortalId(input.portal_id);
     const limitSql = input.use_ad_limit ? buildAdLimitSql(portalId, input.ad_limit_type) : null;
+    const items = normalizeSummaryItems(input.items, columns);
     const selectionSql = buildRuleSelectSqlForSummary(
       sourceTable,
       filters,
@@ -712,9 +713,9 @@ export async function previewRuleSummary(input: RuleSummaryInput): Promise<RuleS
       input.include_locked ?? true,
       input.active ?? true,
       publicationPriority,
-      limitSql
+      limitSql,
+      summarySelectionColumns(items, columns)
     );
-    const items = normalizeSummaryItems(input.items, columns);
     if (!items.length) {
       const totalResult = await client.query<{ total: number }>(
         `select count(*)::int as total from (${selectionSql}) summary_selection`
@@ -744,7 +745,8 @@ function buildRuleSelectSqlForSummary(
   includeLocked: boolean,
   active: boolean,
   publicationPriority: PublicationPriority,
-  limitSql?: string | null
+  limitSql?: string | null,
+  selectColumns?: string[]
 ) {
   return buildRuleSelectSql(
     sourceTable,
@@ -754,7 +756,8 @@ function buildRuleSelectSqlForSummary(
     active,
     undefined,
     limitSql ? publicationPriority : DEFAULT_PUBLICATION_PRIORITY,
-    limitSql
+    limitSql,
+    selectColumns
   );
 }
 
@@ -775,6 +778,29 @@ type NormalizedRuleSummaryItem = {
   filterKind: ColumnMetadata["filter_kind"];
   target: NonNullable<ReturnType<typeof resolveRuleColumnTarget>>;
 };
+
+function summarySelectionColumns(items: NormalizedRuleSummaryItem[], columns: ColumnMetadata[]) {
+  const selected = new Set<string>();
+  for (const item of items) selected.add(item.column);
+
+  if (!selected.size) {
+    const fallbackColumn =
+      summaryBaseColumn(columns, "id_interno") ??
+      summaryBaseColumn(columns, "codigo_crm") ??
+      columns.find((column) => !Array.isArray(column.json_path) || !column.json_path.length);
+    if (fallbackColumn) selected.add(fallbackColumn.column_name);
+  }
+
+  return [...selected];
+}
+
+function summaryBaseColumn(columns: ColumnMetadata[], columnName: string) {
+  return columns.find(
+    (column) =>
+      column.column_name === columnName &&
+      (!Array.isArray(column.json_path) || !column.json_path.length)
+  );
+}
 
 function normalizeSummaryItems(items: unknown, columns: ColumnMetadata[]): NormalizedRuleSummaryItem[] {
   if (!Array.isArray(items)) return [];

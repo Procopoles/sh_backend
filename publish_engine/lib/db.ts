@@ -154,6 +154,39 @@ async function runControlSchemaMigration(client: PoolClient) {
   `);
 
   await client.query(`
+    do $$
+    begin
+      if to_regclass('public.base_imoveis') is not null then
+        execute $index$
+          create index if not exists idx_base_imoveis_prime_score_filter_numeric
+          on public.base_imoveis using btree ((
+            case
+              when (prime_score #>> ARRAY['prime_score']) ~ '^-?[0-9]+([.][0-9]+)?$'
+              then (prime_score #>> ARRAY['prime_score'])::numeric
+            end
+          ))
+        $index$;
+
+        execute $index$
+          create index if not exists idx_base_imoveis_prime_score_localizacao_nota_numeric
+          on public.base_imoveis using btree ((
+            case
+              when (prime_score #>> ARRAY['localizacao','nota']) ~ '^-?[0-9]+([.][0-9]+)?$'
+              then (prime_score #>> ARRAY['localizacao','nota'])::numeric
+            end
+          ))
+        $index$;
+
+        execute $index$
+          create index if not exists idx_base_imoveis_publicacao_portais_gin
+          on public.base_imoveis using gin (publicacao_portais jsonb_path_ops)
+        $index$;
+      end if;
+    end
+    $$;
+  `);
+
+  await client.query(`
     create or replace function public.publish_slugify(value text)
     returns text
     language sql

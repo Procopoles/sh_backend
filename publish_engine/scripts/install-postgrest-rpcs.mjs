@@ -111,6 +111,37 @@ create table if not exists public.publish_portal_ad_types (
 create index if not exists publish_portal_ad_types_portal_id_idx
 on public.publish_portal_ad_types(portal_id);
 
+do $$
+begin
+  if to_regclass('public.base_imoveis') is not null then
+    execute $index$
+      create index if not exists idx_base_imoveis_prime_score_filter_numeric
+      on public.base_imoveis using btree ((
+        case
+          when (prime_score #>> ARRAY['prime_score']) ~ '^-?[0-9]+([.][0-9]+)?$'
+          then (prime_score #>> ARRAY['prime_score'])::numeric
+        end
+      ))
+    $index$;
+
+    execute $index$
+      create index if not exists idx_base_imoveis_prime_score_localizacao_nota_numeric
+      on public.base_imoveis using btree ((
+        case
+          when (prime_score #>> ARRAY['localizacao','nota']) ~ '^-?[0-9]+([.][0-9]+)?$'
+          then (prime_score #>> ARRAY['localizacao','nota'])::numeric
+        end
+      ))
+    $index$;
+
+    execute $index$
+      create index if not exists idx_base_imoveis_publicacao_portais_gin
+      on public.base_imoveis using gin (publicacao_portais jsonb_path_ops)
+    $index$;
+  end if;
+end
+$$;
+
 alter table if exists public.publish_portal_ad_types
 add column if not exists slug text;
 
@@ -1344,7 +1375,7 @@ create or replace function public.preview_publish_rule_summary(
 )
 returns jsonb
 language plpgsql
-stable
+volatile
 security definer
 set search_path = public, pg_catalog
 as $$
@@ -1354,6 +1385,7 @@ declare
   limit_sql text := '';
   source_name text := coalesce(nullif(source_table, ''), 'base_imoveis');
   selection_sql text;
+  selection_columns_sql text;
   total_count integer := 0;
   summary_items jsonb := '[]'::jsonb;
   summary_item jsonb;
@@ -1393,8 +1425,43 @@ begin
     limit_sql := format(' limit %s', public.publish_ad_limit_quota(portal_id, ad_limit_type));
   end if;
 
-  selection_sql := format('select b.* from public.%I b where %s%s%s', source_name, where_sql, order_sql, limit_sql);
-  execute format('select count(*)::int from (%s) summary_selection', selection_sql) into total_count;
+  select string_agg(format('b.%I', selected_columns.column_name), ', ' order by selected_columns.ordinal_position)
+  into selection_columns_sql
+  from (
+    select distinct c.column_name, c.ordinal_position
+    from jsonb_array_elements(
+      case when jsonb_typeof(items) = 'array' then items else '[]'::jsonb end
+    ) summary_item(value)
+    join information_schema.columns c
+      on c.table_schema = 'public'
+     and c.table_name = 'base_imoveis'
+     and c.column_name = summary_item.value->>'column'
+    where public.publish_filter_kind(c.data_type) <> 'other'
+  ) selected_columns;
+
+  if selection_columns_sql is null then
+    select format('b.%I', c.column_name)
+    into selection_columns_sql
+    from information_schema.columns c
+    where c.table_schema = 'public'
+      and c.table_name = 'base_imoveis'
+      and c.column_name in ('id_interno', 'codigo_crm')
+    order by case c.column_name when 'id_interno' then 0 else 1 end
+    limit 1;
+  end if;
+
+  selection_sql := format(
+    'select %s from public.%I b where %s%s%s',
+    coalesce(selection_columns_sql, '1 as __summary_row'),
+    source_name,
+    where_sql,
+    order_sql,
+    limit_sql
+  );
+  execute 'drop table if exists pg_temp.rule_summary_selection';
+  execute format('create temporary table rule_summary_selection on commit drop as %s', selection_sql);
+  selection_sql := 'select * from pg_temp.rule_summary_selection';
+  execute 'select count(*)::int from pg_temp.rule_summary_selection' into total_count;
 
   for summary_item in
     select value
@@ -1705,7 +1772,7 @@ $$;
 create or replace function public.preview_publish_rule_summary(jsonb)
 returns jsonb
 language sql
-stable
+volatile
 security definer
 set search_path = public, pg_catalog
 as $$
