@@ -1,4 +1,13 @@
-import type { ColumnMetadata, Portal, PortalAdType, PublicationPriority, RuleFilters, RuleSummaryConfigItem, SourceViewMetadata } from "@/lib/types";
+import type {
+  ColumnMetadata,
+  Portal,
+  PortalAdType,
+  PublicationPriority,
+  PublicationRule,
+  RuleFilters,
+  RuleSummaryConfigItem,
+  SourceViewMetadata
+} from "@/lib/types";
 
 export type MetadataResponse = {
   columns: ColumnMetadata[];
@@ -27,8 +36,31 @@ export type RuleForm = {
   summary_config?: RuleSummaryConfigItem[] | null;
 };
 
-export type ActiveView = "portals" | "rules" | "status";
+export type ActiveView = "portals" | "rules" | "automations" | "status";
 export type PanelMode = "view" | "edit";
+export type PreviewSortDirection = "asc" | "desc";
+
+export type RuleRowsPreview = {
+  columns: Array<{ key: string; label: string }>;
+  rows: Array<Record<string, unknown>>;
+};
+
+export type RulePreview = {
+  count: number;
+  limited_count?: number | null;
+};
+
+export type RuleTreeRow = {
+  rule: PublicationRule;
+  depth: number;
+  parentRule?: PublicationRule;
+};
+
+export type StatusPortalGroup = {
+  portal: Portal | null;
+  portalId: number;
+  rules: PublicationRule[];
+};
 
 export const EMPTY_PORTAL: PortalForm = { name: "", slug: "", description: "", logo_url: null, active: true, ad_types: [] };
 export const EMPTY_FILTERS: RuleFilters = { combinator: "and", conditions: [] };

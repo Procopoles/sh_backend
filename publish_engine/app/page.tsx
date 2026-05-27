@@ -1,15 +1,51 @@
 ﻿"use client";
 
-import { ArrowDownAZ, ArrowUpAZ, Filter, Globe2, Image, ListOrdered, Loader2, Search } from "lucide-react";
-import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Filter, Globe2, Image, Loader2, Search } from "lucide-react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./page.css";
+import { AutomationDirectory } from "./_components/automation-directory";
 import { FilterGroupBuilder } from "./_components/filter-group-builder";
 import { MaterialIcon } from "./_components/material-icon";
 import { NumericInput } from "./_components/numeric-input";
+import { PortalDirectory } from "./_components/portal-directory";
 import { PublicationPriorityEditor, publicationPrioritySummary } from "./_components/publication-priority-editor";
+import { RuleDirectory } from "./_components/rule-directory";
+import { RulePreviewRows } from "./_components/rule-preview-rows";
 import { RuleSummarySection } from "./_components/rule-summary-section";
-import { formatNumber, isNumericValue, localizedNumberToNumber } from "./_lib/number-format";
-import { EMPTY_FILTERS, EMPTY_PORTAL, EMPTY_PUBLICATION_PRIORITY, type ActiveView, type MetadataResponse, type PanelMode, type PortalForm, type RuleForm } from "./_lib/page-models";
+import { SourceViewPicker, type SourceViewOption } from "./_components/source-view-picker";
+import { StatusDirectory } from "./_components/status-directory";
+import { fetchJson } from "./_lib/client-api";
+import { formatNumber, localizedNumberToNumber } from "./_lib/number-format";
+import {
+  AD_TIER_HELP,
+  AD_TYPE_NAME_HELP,
+  HEALTHCHECK_INTERVAL_MINUTES,
+  HEALTHCHECK_INTERVAL_MS,
+  PORTAL_SLUG_HELP,
+  PREVIEW_RULE_ORDER_COLUMN
+} from "./_lib/page-constants";
+import {
+  EMPTY_FILTERS,
+  EMPTY_PORTAL,
+  EMPTY_PUBLICATION_PRIORITY,
+  type ActiveView,
+  type MetadataResponse,
+  type PanelMode,
+  type PreviewSortDirection,
+  type PortalForm,
+  type RuleForm,
+  type RulePreview,
+  type RuleRowsPreview
+} from "./_lib/page-models";
+import {
+  adLimitTypeLabel,
+  compareAdTypesByQuantity,
+  displayValue,
+  nextAvailableAdTier,
+  normalizeAdTier,
+  ruleAdLimitQuota,
+  ruleTotalQuota
+} from "./_lib/portal-form-utils";
 import { createDefaultRuleSummaryConfig } from "./_lib/rule-summary-defaults";
 import {
   cloneGroup,
@@ -19,11 +55,22 @@ import {
   insertItemAtPath,
   replaceGroupAtPath
 } from "./_lib/rule-filter-utils";
+import { buildRuleTreeRows, clonePublicationPriority, prioritySignature } from "./_lib/rule-list-utils";
+import { matchesSearch } from "./_lib/search-utils";
+import {
+  buildStatusPublishedQuery,
+  buildStatusUnexpectedQuery,
+  formatTimestamp,
+  groupStatusRules,
+  ruleHealthTone,
+  statusFinalViewName,
+  statusLabel
+} from "./_lib/status-monitoring-utils";
 import { buildAdLimitSql, buildRuleSelectSql, sanitizeFilters, sanitizePublicationPriority } from "@/lib/rules";
 import type {
   Portal,
   PortalAdType,
-  PublicationPriority,
+  PublishAutomation,
   PublicationRule,
   RuleFilterGroup,
   RuleFilters,
@@ -32,267 +79,14 @@ import type {
   RuleSummaryResponse
 } from "@/lib/types";
 
-type RuleRowsPreview = {
-  columns: Array<{ key: string; label: string }>;
-  rows: Array<Record<string, unknown>>;
-};
-
-type RulePreview = {
-  count: number;
-  limited_count?: number | null;
-};
-
-type PreviewSortDirection = "asc" | "desc";
-
-type RuleTreeRow = {
-  rule: PublicationRule;
-  depth: number;
-  parentRule?: PublicationRule;
-};
-
-const PREVIEW_RULE_ORDER_COLUMN = "__rule_order__";
-const HEALTHCHECK_INTERVAL_MINUTES = Math.max(
-  1,
-  Number(process.env.NEXT_PUBLIC_RULE_HEALTHCHECK_INTERVAL_MINUTES ?? "5") || 5
-);
-const HEALTHCHECK_INTERVAL_MS = HEALTHCHECK_INTERVAL_MINUTES * 60 * 1000;
-const PORTAL_SLUG_HELP =
-  "Identificador interno do portal usado pelo sistema. Deve corresponder exatamente a chave em publicacao_portais na base_imoveis, como grupo_zap, imovel_web ou chaves_na_mao. Use minusculas, numeros e _ sem espacos.";
-const AD_TIER_HELP = "Nível do anúncio.";
-
-function displayValue(value: string | number | null | undefined) {
-  if (typeof value === "number") return formatNumber(value);
-  const text = String(value ?? "").trim();
-  return text || "-";
-}
-
-function formatTimestamp(value: string | null | undefined) {
-  if (!value) return "-";
-  return new Intl.DateTimeFormat("pt-BR", {
-    dateStyle: "short",
-    timeStyle: "short"
-  }).format(new Date(value));
-}
-
-function adLimitTypeLabel(value: string | null | undefined, portal?: Portal | null) {
-  if (value === "total" || !value) return "Total";
-  return portal?.ad_types?.find((adType) => adType.slug === value)?.name ?? value;
-}
-
-function ruleTotalQuota(portal?: Portal | null) {
-  return (portal?.ad_types ?? []).reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
-}
-
-function ruleAdLimitQuota(portal: Portal | null | undefined, adLimitType: string | null | undefined) {
-  if (!portal) return 0;
-  if (!adLimitType || adLimitType === "total") return ruleTotalQuota(portal);
-  return portal.ad_types?.find((adType) => adType.slug === adLimitType)?.quantity ?? 0;
-}
-
-function compareAdTypesByQuantity<T extends Pick<PortalAdType, "quantity" | "tier" | "name">>(left: T, right: T) {
-  const quantityDelta = (Number(right.quantity) || 0) - (Number(left.quantity) || 0);
-  if (quantityDelta !== 0) return quantityDelta;
-  const tierDelta = (Number(left.tier) || 0) - (Number(right.tier) || 0);
-  if (tierDelta !== 0) return tierDelta;
-  return left.name.localeCompare(right.name, "pt-BR");
-}
-
-function normalizeAdTier(value: number | string | null | undefined) {
-  const tier = Math.trunc(Number(value) || 0);
-  if (tier < 1) return 1;
-  if (tier > 10) return 10;
-  return tier;
-}
-
-function nextAvailableAdTier(adTypes: PortalForm["ad_types"]) {
-  const usedTiers = new Set(adTypes.map((adType) => normalizeAdTier(adType.tier)));
-  for (let tier = 1; tier <= 10; tier += 1) {
-    if (!usedTiers.has(tier)) return tier;
-  }
-  return 10;
-}
-
-function formatRuleDelta(value: number) {
-  return value > 0 ? `+${formatNumber(value)}` : formatNumber(value);
-}
-
-function ruleDeltaTone(value: number) {
-  if (value > 0) return "positive";
-  if (value < 0) return "negative";
-  return "neutral";
-}
-
-function ruleHealthTone(rule: PublicationRule) {
-  if (rule.health_error) return "error";
-  if (rule.health_pending_count == null || rule.health_unexpected_count == null) return "unknown";
-  return rule.health_pending_count > 0 || rule.health_unexpected_count > 0 ? "warning" : "ok";
-}
-
-function quoteSqlIdentifier(value: string) {
-  return `"${value.replace(/"/g, '""')}"`;
-}
-
-function quoteSqlLiteral(value: string) {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-function statusAdTypeSlug(value: string) {
-  return value
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
-
-function statusFinalViewName(portalSlug: string) {
-  return `pc_${portalSlug}_final`;
-}
-
-function statusLabel(rule: PublicationRule) {
-  if (rule.health_error) return "Erro";
-  if (rule.health_pending_count == null || rule.health_unexpected_count == null) return "Pendente";
-  return rule.health_pending_count > 0 || rule.health_unexpected_count > 0 ? "Divergente" : "OK";
-}
-
-function buildStatusPublishedQuery(rule: PublicationRule) {
-  if (!rule.portal_slug) return "Portal indisponivel para montar a query.";
-
-  const portalLiteral = quoteSqlLiteral(rule.portal_slug);
-  const finalViewName = statusFinalViewName(rule.portal_slug);
-  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
-  const typeFilter = shouldFilterType && rule.ad_limit_type
-    ? `\n  AND b.ad_type_slug = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}\n  AND b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
-    : "";
-
-  return [
-    "SELECT count(*)::int AS count",
-    `FROM public.${quoteSqlIdentifier(finalViewName)} b`,
-    `WHERE COALESCE((b.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter};`
-  ].join("\n");
-}
-
-function buildStatusUnexpectedQuery(rule: PublicationRule) {
-  if (!rule.portal_slug) return "Portal indisponivel para montar a query.";
-
-  const portalLiteral = quoteSqlLiteral(rule.portal_slug);
-  const finalViewName = statusFinalViewName(rule.portal_slug);
-  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
-  const typeFilter = shouldFilterType && rule.ad_limit_type
-    ? `\n  AND ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}`
-    : "";
-
-  return [
-    "SELECT ia.*",
-    "FROM public.imoveis_ativos ia",
-    `WHERE COALESCE((ia.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) IS TRUE${typeFilter}`,
-    "  AND NOT EXISTS (",
-    "    SELECT 1",
-    `    FROM public.${quoteSqlIdentifier(finalViewName)} p`,
-    "    WHERE p.codigo_crm = ia.codigo_crm",
-    shouldFilterType && rule.ad_limit_type ? `      AND p.ad_type_slug = ${quoteSqlLiteral(statusAdTypeSlug(rule.ad_limit_type))}` : "",
-    "  )",
-    "LIMIT 100;"
-  ].filter(Boolean).join("\n");
-}
-
-function RuleCountCell({ rule }: { rule: PublicationRule }) {
-  if (rule.use_ad_limit && rule.last_limited_count != null && rule.last_count != null) {
-    const delta = rule.last_count - rule.last_limited_count;
-
-    return (
-      <span className="rule-count-cell">
-        <span className="rule-count-main">
-          <MaterialIcon name="lock" size={11} className="rule-count-lock" />
-          <strong>{formatNumber(rule.last_limited_count)}</strong>
-        </span>
-        <span className="rule-count-total">/ {formatNumber(rule.last_count)}</span>
-        <span className={`rule-count-delta ${ruleDeltaTone(delta)}`}>{formatRuleDelta(delta)}</span>
-      </span>
-    );
-  }
-
-  return <span className="rule-count-cell plain">{rule.last_count == null ? "-" : formatNumber(rule.last_count)}</span>;
-}
-
-function displayPreviewValue(value: unknown, column?: RuleRowsPreview["columns"][number]) {
-  if (value == null) return "-";
-  if (value instanceof Date) return value.toLocaleString("pt-BR");
-  if (column && isIdentifierPreviewColumn(column) && ["number", "string", "bigint", "boolean"].includes(typeof value)) return String(value);
-  if (typeof value === "number" || isNumericValue(value)) return formatNumber(value);
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-}
-
-function isIdentifierPreviewColumn(column: RuleRowsPreview["columns"][number]) {
-  return [column.key, column.label].some((name) => {
-    const normalizedName = name
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase();
-
-    return /(^|[^a-z0-9])(id|codigo|cod|crm|uuid)([^a-z0-9]|$)/.test(normalizedName);
-  });
-}
-
-function buildRuleTreeRows(visibleRules: PublicationRule[]): RuleTreeRow[] {
-  const ruleByViewName = new Map<string, PublicationRule>();
-  for (const rule of visibleRules) {
-    if (rule.view_name) ruleByViewName.set(rule.view_name, rule);
-  }
-
-  const childrenByParentId = new Map<number, PublicationRule[]>();
-  const roots: PublicationRule[] = [];
-  for (const rule of visibleRules) {
-    const parent = rule.source_table ? ruleByViewName.get(rule.source_table) : undefined;
-    if (parent && parent.id !== rule.id) {
-      childrenByParentId.set(parent.id, [...(childrenByParentId.get(parent.id) ?? []), rule]);
-    } else {
-      roots.push(rule);
-    }
-  }
-
-  const rows: RuleTreeRow[] = [];
-  const visited = new Set<number>();
-  const appendRule = (rule: PublicationRule, depth: number, parentRule?: PublicationRule) => {
-    if (visited.has(rule.id)) return;
-    visited.add(rule.id);
-    rows.push({ rule, depth, parentRule });
-    for (const child of childrenByParentId.get(rule.id) ?? []) {
-      appendRule(child, depth + 1, rule);
-    }
-  };
-
-  for (const root of roots) appendRule(root, 0);
-  for (const rule of visibleRules) appendRule(rule, 0);
-
-  return rows;
-}
-
-function clonePublicationPriority(priority: PublicationPriority): PublicationPriority {
-  return JSON.parse(JSON.stringify(priority)) as PublicationPriority;
-}
-
-function prioritySignature(priority: PublicationPriority) {
-  return JSON.stringify(priority);
-}
-
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers }
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error ?? "Falha na requisicao.");
-  return data;
-}
-
 export default function Home() {
   const [portals, setPortals] = useState<Portal[]>([]);
   const [rules, setRules] = useState<PublicationRule[]>([]);
+  const [automations, setAutomations] = useState<PublishAutomation[]>([]);
   const [metadata, setMetadata] = useState<MetadataResponse | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>("portals");
   const [selectedPortalId, setSelectedPortalId] = useState<number | null>(null);
+  const [selectedAutomationKey, setSelectedAutomationKey] = useState<string | null>(null);
   const [portalMode, setPortalMode] = useState<PanelMode>("view");
   const [portalForm, setPortalForm] = useState<PortalForm>(EMPTY_PORTAL);
   const [ruleForm, setRuleForm] = useState<RuleForm | null>(null);
@@ -300,6 +94,7 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [previewLimitedCount, setPreviewLimitedCount] = useState<number | null>(null);
+  const [previewCountLoading, setPreviewCountLoading] = useState(false);
   const [previewRowsLimit, setPreviewRowsLimit] = useState<10 | 100>(10);
   const [previewRows, setPreviewRows] = useState<RuleRowsPreview | null>(null);
   const [previewRowsLoading, setPreviewRowsLoading] = useState(false);
@@ -314,11 +109,20 @@ export default function Home() {
   const [queryPanelOpen, setQueryPanelOpen] = useState(false);
   const [queryCopied, setQueryCopied] = useState(false);
   const [viewNameCopied, setViewNameCopied] = useState(false);
+  const [automationSqlCopied, setAutomationSqlCopied] = useState(false);
   const [detailsPanelCollapsed, setDetailsPanelCollapsed] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const healthcheckInFlightRef = useRef(false);
+  const summaryRequestIdRef = useRef(0);
+  const summaryRequestSignatureRef = useRef("");
+  const previewCountRequestIdRef = useRef(0);
+  const previewRowsRequestIdRef = useRef(0);
+  const previewRequestSignatureRef = useRef("");
+  const lastPreviewRequestSignatureRef = useRef("");
+  const previewCountAutoRefreshRef = useRef(false);
+  const previewRowsAutoRefreshRef = useRef(false);
   const [groupEditor, setGroupEditor] = useState<{
     mode: "create" | "edit";
     path: number[];
@@ -338,25 +142,55 @@ export default function Home() {
     [filterableColumns, ruleForm?.filters, ruleForm?.publication_priority]
   );
   const activeSummaryConfig = summaryConfigCustom ? summaryConfig : defaultSummaryConfig;
-  const activeViewTitle = activeView === "portals" ? "Portais" : activeView === "rules" ? "Regras" : "Status";
+  const activeViewTitle =
+    activeView === "portals"
+      ? "Portais"
+      : activeView === "rules"
+        ? "Regras"
+        : activeView === "automations"
+          ? "Automacoes"
+          : "Status";
   const searchPlaceholder =
-    activeView === "portals" ? "Buscar portal" : activeView === "rules" ? "Buscar regra" : "Buscar regra ativa";
+    activeView === "portals"
+      ? "Buscar portal"
+      : activeView === "rules"
+        ? "Buscar regra"
+        : activeView === "automations"
+          ? "Buscar automacao"
+          : "Buscar regra ativa";
   const portalFormTotal = portalForm.ad_types.reduce((total, adType) => total + (Number(adType.quantity) || 0), 0);
   const orderedPortalFormAdTypes = portalForm.ad_types
     .map((adType, index) => ({ adType, index }))
     .sort((left, right) => compareAdTypesByQuantity(left.adType, right.adType));
-  const isPortalEditing = portalMode === "edit" || !portalForm.id;
+  const isPortalEditing = portalMode === "edit";
   const isRuleEditing = ruleMode === "edit" || !ruleForm?.id;
-  const visiblePortals = portals.filter((portal) =>
-    `${portal.name} ${portal.description ?? ""}`.toLowerCase().includes(query.toLowerCase())
+  const visiblePortals = useMemo(
+    () => portals.filter((portal) => matchesSearch(query, [portal.name, portal.description])),
+    [portals, query]
   );
-  const visibleRules = rules.filter((rule) =>
-    `${rule.name} ${rule.description ?? ""} ${rule.portal_name ?? ""} ${rule.view_name ?? ""} ${rule.source_table ?? ""}`
-      .toLowerCase()
-      .includes(query.toLowerCase())
+  const visibleRules = useMemo(
+    () => rules.filter((rule) => matchesSearch(query, [rule.name, rule.description, rule.portal_name, rule.view_name, rule.source_table])),
+    [query, rules]
+  );
+  const visibleAutomations = useMemo(
+    () =>
+      automations.filter((automation) =>
+        matchesSearch(query, [
+          automation.name,
+          automation.description,
+          automation.key,
+          automation.database_name,
+          automation.schema_name,
+          automation.table_name,
+          automation.target_column,
+          automation.run_mode
+        ])
+      ),
+    [automations, query]
   );
   const ruleTreeRows = useMemo(() => buildRuleTreeRows(visibleRules), [visibleRules]);
   const activeRules = useMemo(() => rules.filter((rule) => rule.active), [rules]);
+  const activeAutomations = useMemo(() => automations.filter((automation) => automation.active), [automations]);
   const monitoredActiveRules = useMemo(
     () => activeRules.filter((rule) => rule.portal_id != null),
     [activeRules]
@@ -364,45 +198,15 @@ export default function Home() {
   const portalById = useMemo(() => new Map(portals.map((portal) => [portal.id, portal])), [portals]);
   const visibleStatusRules = useMemo(
     () =>
-      monitoredActiveRules.filter((rule) =>
-        `${rule.name} ${rule.description ?? ""} ${rule.portal_name ?? ""} ${rule.portal_slug ?? ""} ${rule.view_name ?? ""}`
-          .toLowerCase()
-          .includes(query.toLowerCase())
-      ),
+      monitoredActiveRules.filter((rule) => matchesSearch(query, [rule.name, rule.description, rule.portal_name, rule.portal_slug, rule.view_name])),
     [monitoredActiveRules, query]
   );
-  const statusPortalGroups = useMemo(() => {
-    const groups = new Map<
-      number,
-      {
-        portal: Portal | null;
-        portalId: number;
-        rules: PublicationRule[];
-      }
-    >();
-
-    for (const rule of visibleStatusRules) {
-      if (rule.portal_id == null) continue;
-      const currentGroup =
-        groups.get(rule.portal_id) ??
-        {
-          portal: portalById.get(rule.portal_id) ?? null,
-          portalId: rule.portal_id,
-          rules: []
-        };
-      currentGroup.rules.push(rule);
-      groups.set(rule.portal_id, currentGroup);
-    }
-
-    return Array.from(groups.values()).sort((left, right) => {
-      const leftName = left.portal?.name ?? left.rules[0]?.portal_name ?? "";
-      const rightName = right.portal?.name ?? right.rules[0]?.portal_name ?? "";
-      return leftName.localeCompare(rightName, "pt-BR");
-    });
-  }, [portalById, visibleStatusRules]);
+  const statusPortalGroups = useMemo(() => groupStatusRules(visibleStatusRules, portalById), [portalById, visibleStatusRules]);
   const selectedStatusRule =
     (selectedStatusRuleId == null ? null : monitoredActiveRules.find((rule) => rule.id === selectedStatusRuleId)) ?? null;
   const selectedStatusPortal = selectedStatusRule?.portal_id ? portalById.get(selectedStatusRule.portal_id) ?? null : null;
+  const selectedAutomation =
+    (selectedAutomationKey == null ? null : automations.find((automation) => automation.key === selectedAutomationKey)) ?? null;
   const selectedPortalRules = rules.filter((rule) => rule.portal_id != null && rule.portal_id === selectedPortalId);
   const selectedRulePortal = portals.find((portal) => portal.id === ruleForm?.portal_id) ?? null;
   const ruleByViewName = useMemo(
@@ -437,27 +241,23 @@ export default function Home() {
     ? ruleForm?.ad_limit_type ?? "total"
     : "total";
   const currentAdLimitQuota = ruleForm?.use_ad_limit ? ruleAdLimitQuota(selectedRulePortal, currentAdLimitType) : null;
-  const ruleSourceOptions = useMemo(() => {
+  const ruleSourceOptions = useMemo<SourceViewOption[]>(() => {
     const currentRuleViewName = rules.find((rule) => rule.id === ruleForm?.id)?.view_name;
-    const options = [
-      { value: "base_imoveis", label: "Base principal" },
-      ...(metadata?.source_views ?? [])
-        .filter((view) => view.view_name !== currentRuleViewName)
-        .map((view) => {
-          const rule = ruleByViewName.get(view.view_name);
-          return {
-            value: view.view_name,
-            label: rule ? `${rule.name} (${view.view_name})` : view.view_name
-          };
-        })
-    ];
+    const sourceViewOptions = (metadata?.source_views ?? [])
+      .filter((view) => view.view_name !== currentRuleViewName)
+      .map((view) => {
+        const rule = ruleByViewName.get(view.view_name);
+        return buildSourceViewOption(view.view_name, view.view_type, rule, portalById);
+      })
+      .sort(compareSourceViewOptions);
+    const options = [baseSourceViewOption(), ...sourceViewOptions];
 
     if (ruleForm?.source_table && !options.some((option) => option.value === ruleForm.source_table)) {
-      options.push({ value: ruleForm.source_table, label: `${ruleForm.source_table} (indisponivel)` });
+      options.push(unavailableSourceViewOption(ruleForm.source_table));
     }
 
     return options;
-  }, [metadata?.source_views, ruleByViewName, rules, ruleForm?.id, ruleForm?.source_table]);
+  }, [metadata?.source_views, portalById, ruleByViewName, rules, ruleForm?.id, ruleForm?.source_table]);
 
   const currentRuleQuery = useMemo(() => {
     if (!ruleForm) return "";
@@ -481,6 +281,19 @@ export default function Home() {
       return currentError instanceof Error ? currentError.message : "Nao foi possivel montar a query.";
     }
   }, [currentAdLimitType, filterableColumns, ruleForm]);
+  const previewRequestSignature = useMemo(() => {
+    if (!ruleForm) return "";
+    return JSON.stringify({
+      active: ruleForm.active,
+      include_locked: ruleForm.include_locked,
+      source_table: ruleForm.source_table,
+      portal_id: ruleForm.portal_id,
+      use_ad_limit: ruleForm.use_ad_limit,
+      ad_limit_type: currentAdLimitType,
+      filters: ruleForm.filters,
+      publication_priority: ruleForm.publication_priority
+    });
+  }, [currentAdLimitType, ruleForm]);
   const summaryRequestSignature = useMemo(() => {
     if (!ruleForm) return "";
     return JSON.stringify({
@@ -509,20 +322,36 @@ export default function Home() {
   }, [ruleForm?.view_name]);
 
   useEffect(() => {
+    setAutomationSqlCopied(false);
+  }, [selectedAutomation?.sql_text]);
+
+  useEffect(() => {
+    if (activeView !== "automations") return;
+    if (selectedAutomationKey && automations.some((automation) => automation.key === selectedAutomationKey)) return;
+    setSelectedAutomationKey(automations[0]?.key ?? null);
+  }, [activeView, automations, selectedAutomationKey]);
+
+  useEffect(() => {
     if (previewSortColumn === PREVIEW_RULE_ORDER_COLUMN) return;
     if (previewRows?.columns.some((column) => column.key === previewSortColumn)) return;
     setPreviewSortColumn(PREVIEW_RULE_ORDER_COLUMN);
   }, [previewRows, previewSortColumn]);
 
   useEffect(() => {
+    summaryRequestSignatureRef.current = summaryRequestSignature;
+    summaryRequestIdRef.current += 1;
+
     if (!ruleForm || !summaryRequestSignature) {
       setRuleSummary(null);
+      setRuleSummaryLoading(false);
       return;
     }
 
+    setRuleSummary(null);
+    setRuleSummaryLoading(true);
     const controller = new AbortController();
     const timeout = window.setTimeout(() => {
-      void loadRuleSummary(controller.signal);
+      void loadRuleSummary(controller.signal, summaryRequestSignature);
     }, 450);
 
     return () => {
@@ -530,6 +359,46 @@ export default function Home() {
       controller.abort();
     };
   }, [summaryRequestSignature]);
+
+  useEffect(() => {
+    previewRequestSignatureRef.current = previewRequestSignature;
+
+    if (!ruleForm || !previewRequestSignature) {
+      resetRulePreviewState();
+      return;
+    }
+
+    const previousSignature = lastPreviewRequestSignatureRef.current;
+    lastPreviewRequestSignatureRef.current = previewRequestSignature;
+    if (!previousSignature || previousSignature === previewRequestSignature) return;
+
+    const shouldRefreshCount = previewCountAutoRefreshRef.current;
+    const shouldRefreshRows = previewRowsAutoRefreshRef.current;
+
+    previewCountRequestIdRef.current += 1;
+    previewRowsRequestIdRef.current += 1;
+    if (shouldRefreshCount) {
+      setPreviewCount(null);
+      setPreviewLimitedCount(null);
+      setPreviewCountLoading(false);
+    }
+    if (shouldRefreshRows) {
+      setPreviewRows(null);
+      setPreviewRowsLoading(false);
+    }
+    if (!shouldRefreshCount && !shouldRefreshRows) return;
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      if (shouldRefreshCount) void previewRule({ signal: controller.signal, requestSignature: previewRequestSignature });
+      if (shouldRefreshRows) void previewRuleRows({ signal: controller.signal, requestSignature: previewRequestSignature });
+    }, 450);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [previewRequestSignature]);
 
   useEffect(() => {
     if ((activeView !== "rules" && activeView !== "status") || !rules.length) return;
@@ -546,14 +415,21 @@ export default function Home() {
     setLoading(true);
     setError(null);
     try {
-      const [portalData, ruleData, metadataData] = await Promise.all([
+      const [portalData, ruleData, automationData, metadataData] = await Promise.all([
         fetchJson<{ portals: Portal[] }>("/api/portals"),
         fetchJson<{ rules: PublicationRule[] }>("/api/rules"),
+        fetchJson<{ automations: PublishAutomation[] }>("/api/automations"),
         fetchJson<MetadataResponse>("/api/metadata")
       ]);
       setPortals(portalData.portals);
       setRules(ruleData.rules);
+      setAutomations(automationData.automations);
       setMetadata(metadataData);
+      setSelectedAutomationKey((current) =>
+        current && automationData.automations.some((automation) => automation.key === current)
+          ? current
+          : automationData.automations[0]?.key ?? null
+      );
 
       const nextPortal = portalData.portals.find((portal) => portal.id === selectedPortalId) ?? portalData.portals[0];
       setSelectedPortalId((current) => current ?? nextPortal?.id ?? null);
@@ -568,10 +444,22 @@ export default function Home() {
     }
   }
 
-  function resetRuleForm(portalId: number | null = null) {
+  function resetRulePreviewState() {
+    previewCountRequestIdRef.current += 1;
+    previewRowsRequestIdRef.current += 1;
+    previewRequestSignatureRef.current = "";
+    lastPreviewRequestSignatureRef.current = "";
+    previewCountAutoRefreshRef.current = false;
+    previewRowsAutoRefreshRef.current = false;
     setPreviewCount(null);
     setPreviewLimitedCount(null);
+    setPreviewCountLoading(false);
     setPreviewRows(null);
+    setPreviewRowsLoading(false);
+  }
+
+  function resetRuleForm(portalId: number | null = null) {
+    resetRulePreviewState();
     setRuleSummary(null);
     setSummaryConfig([]);
     setSummaryConfigCustom(false);
@@ -614,9 +502,7 @@ export default function Home() {
     setPortalMode("edit");
     setSelectedPortalId(null);
     setRuleForm(null);
-    setPreviewCount(null);
-    setPreviewLimitedCount(null);
-    setPreviewRows(null);
+    resetRulePreviewState();
     setRuleSummary(null);
     setSummaryConfig([]);
     setSummaryConfigCustom(false);
@@ -631,6 +517,10 @@ export default function Home() {
 
   function openRulesView() {
     setActiveView("rules");
+  }
+
+  function openAutomationsView() {
+    setActiveView("automations");
   }
 
   function openStatusView() {
@@ -750,7 +640,7 @@ export default function Home() {
       setPortalForm(EMPTY_PORTAL);
       setPortalMode("view");
       setRuleForm(null);
-      setPreviewLimitedCount(null);
+      resetRulePreviewState();
       await loadAll();
     } catch (currentError) {
       setError(currentError instanceof Error ? currentError.message : "Erro ao excluir portal.");
@@ -800,9 +690,7 @@ export default function Home() {
     try {
       await fetchJson(`/api/rules/${id}`, { method: "DELETE" });
       setRuleForm(null);
-      setPreviewCount(null);
-      setPreviewLimitedCount(null);
-      setPreviewRows(null);
+      resetRulePreviewState();
       setRuleSummary(null);
       setSummaryConfig([]);
       setSummaryConfigCustom(false);
@@ -815,51 +703,67 @@ export default function Home() {
     }
   }
 
-  async function previewRule() {
-    if (!ruleForm) return;
-    setSaving(true);
+  async function previewRule(options: { signal?: AbortSignal; requestSignature?: string } = {}) {
+    if (!ruleForm || !previewRequestSignature) return;
+    const requestSignature = options.requestSignature ?? previewRequestSignature;
+    const requestId = ++previewCountRequestIdRef.current;
+    previewCountAutoRefreshRef.current = true;
+    setPreviewCountLoading(true);
     setError(null);
     try {
       const result = await fetchJson<RulePreview>("/api/rules/preview", {
         method: "POST",
+        signal: options.signal,
         body: JSON.stringify({ ...ruleForm, ad_limit_type: currentAdLimitType })
       });
-      setPreviewCount(result.count);
-      setPreviewLimitedCount(result.limited_count ?? null);
+      if (requestId === previewCountRequestIdRef.current && requestSignature === previewRequestSignatureRef.current) {
+        setPreviewCount(result.count);
+        setPreviewLimitedCount(result.limited_count ?? null);
+      }
     } catch (currentError) {
+      if (options.signal?.aborted) return;
       setError(currentError instanceof Error ? currentError.message : "Erro na previa.");
     } finally {
-      setSaving(false);
+      if (requestId === previewCountRequestIdRef.current) setPreviewCountLoading(false);
     }
   }
 
-  async function previewRuleRows(options: { sortColumn?: string; sortDirection?: PreviewSortDirection } = {}) {
-    if (!ruleForm) return;
+  async function previewRuleRows(options: { sortColumn?: string; sortDirection?: PreviewSortDirection; limit?: 10 | 100; signal?: AbortSignal; requestSignature?: string } = {}) {
+    if (!ruleForm || !previewRequestSignature) return;
     const sortColumn = options.sortColumn ?? previewSortColumn;
     const sortDirection = options.sortDirection ?? previewSortDirection;
+    const limit = options.limit ?? previewRowsLimit;
+    const requestSignature = options.requestSignature ?? previewRequestSignature;
+    const requestId = ++previewRowsRequestIdRef.current;
+    previewRowsAutoRefreshRef.current = true;
     setPreviewRowsLoading(true);
     setError(null);
     try {
       const result = await fetchJson<RuleRowsPreview>("/api/rules/preview/rows", {
         method: "POST",
+        signal: options.signal,
         body: JSON.stringify({
           ...ruleForm,
           ad_limit_type: currentAdLimitType,
-          limit: previewRowsLimit,
+          limit,
           preview_sort_column: sortColumn === PREVIEW_RULE_ORDER_COLUMN ? null : sortColumn,
           preview_sort_direction: sortDirection
         })
       });
-      setPreviewRows(result);
+      if (requestId === previewRowsRequestIdRef.current && requestSignature === previewRequestSignatureRef.current) {
+        setPreviewRows(result);
+      }
     } catch (currentError) {
+      if (options.signal?.aborted) return;
       setError(currentError instanceof Error ? currentError.message : "Erro na pre visualizacao.");
     } finally {
-      setPreviewRowsLoading(false);
+      if (requestId === previewRowsRequestIdRef.current) setPreviewRowsLoading(false);
     }
   }
 
-  async function loadRuleSummary(signal?: AbortSignal) {
-    if (!ruleForm) return;
+  async function loadRuleSummary(signal?: AbortSignal, requestSignature = summaryRequestSignature) {
+    if (!ruleForm || !requestSignature) return;
+    const requestId = ++summaryRequestIdRef.current;
     setRuleSummaryLoading(true);
     setError(null);
     try {
@@ -868,12 +772,14 @@ export default function Home() {
         signal,
         body: JSON.stringify({ ...ruleForm, ad_limit_type: currentAdLimitType, items: activeSummaryConfig })
       });
-      if (!signal?.aborted) setRuleSummary(result);
+      if (!signal?.aborted && requestId === summaryRequestIdRef.current && requestSignature === summaryRequestSignatureRef.current) {
+        setRuleSummary(result);
+      }
     } catch (currentError) {
       if (signal?.aborted) return;
       setError(currentError instanceof Error ? currentError.message : "Erro ao gerar resumo.");
     } finally {
-      if (!signal?.aborted) setRuleSummaryLoading(false);
+      if (!signal?.aborted && requestId === summaryRequestIdRef.current) setRuleSummaryLoading(false);
     }
   }
 
@@ -909,6 +815,41 @@ export default function Home() {
     } finally {
       healthcheckInFlightRef.current = false;
       setHealthcheckLoading(false);
+    }
+  }
+
+  async function updateAutomationActive(automation: PublishAutomation, active: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await fetchJson<{ automation: PublishAutomation }>(`/api/automations/${encodeURIComponent(automation.key)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ active })
+      });
+      setAutomations((current) =>
+        current.map((item) => (item.key === result.automation.key ? result.automation : item))
+      );
+      setSelectedAutomationKey(result.automation.key);
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao atualizar automacao.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeAutomation(automation: PublishAutomation) {
+    if (!confirm("Excluir esta automacao? Ela sera desativada e ocultada da listagem.")) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await fetchJson(`/api/automations/${encodeURIComponent(automation.key)}`, { method: "DELETE" });
+      const nextAutomations = automations.filter((item) => item.key !== automation.key);
+      setAutomations(nextAutomations);
+      setSelectedAutomationKey(nextAutomations[0]?.key ?? null);
+    } catch (currentError) {
+      setError(currentError instanceof Error ? currentError.message : "Erro ao excluir automacao.");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -964,13 +905,24 @@ export default function Home() {
     }
   }
 
+  async function copyAutomationSql() {
+    if (!selectedAutomation?.sql_text) return;
+    try {
+      await navigator.clipboard.writeText(selectedAutomation.sql_text);
+      setAutomationSqlCopied(true);
+    } catch {
+      setError("Nao foi possivel copiar o SQL da automacao.");
+    }
+  }
+
   function editRule(rule: PublicationRule, mode: PanelMode = "view") {
     const savedPriority = rule.publication_priority ?? EMPTY_PUBLICATION_PRIORITY;
     const presetPriority = savedPriority.length ? null : priorityFromPresetSource(rule.source_table ?? "base_imoveis");
     const savedSummaryConfig = Array.isArray(rule.summary_config) ? rule.summary_config : null;
+    resetRulePreviewState();
     setPreviewCount(rule.last_count);
     setPreviewLimitedCount(rule.last_limited_count);
-    setPreviewRows(null);
+    previewCountAutoRefreshRef.current = rule.last_count != null || rule.last_limited_count != null;
     setRuleSummary(null);
     setSummaryConfig(savedSummaryConfig ?? []);
     setSummaryConfigCustom(savedSummaryConfig !== null);
@@ -1000,6 +952,24 @@ export default function Home() {
     setPortalMode("view");
   }
 
+  function cancelPortalEdit() {
+    if (portalForm.id) {
+      returnToPortalView();
+      return;
+    }
+
+    const fallbackPortal = selectedPortalId
+      ? portals.find((portal) => portal.id === selectedPortalId) ?? portals[0]
+      : portals[0];
+    if (fallbackPortal) {
+      selectPortal(fallbackPortal, "view");
+      return;
+    }
+
+    setPortalForm(EMPTY_PORTAL);
+    setPortalMode("view");
+  }
+
   function returnToRuleView() {
     if (ruleForm?.id) {
       const savedRule = rules.find((rule) => rule.id === ruleForm.id);
@@ -1016,9 +986,7 @@ export default function Home() {
     }
 
     setRuleForm(null);
-    setPreviewCount(null);
-    setPreviewLimitedCount(null);
-    setPreviewRows(null);
+    resetRulePreviewState();
     setRuleSummary(null);
     setSummaryConfig([]);
     setSummaryConfigCustom(false);
@@ -1048,10 +1016,12 @@ export default function Home() {
     setGroupEditor(null);
   }
 
+  const portalEditorFullscreen = activeView === "portals" && portalMode === "edit";
   const ruleEditorFullscreen = activeView === "rules" && Boolean(ruleForm) && isRuleEditing;
+  const detailsEditorFullscreen = portalEditorFullscreen || ruleEditorFullscreen;
 
   return (
-    <main className={`app-shell ${detailsPanelCollapsed ? "details-panel-collapsed" : ""} ${ruleEditorFullscreen ? "rule-editor-fullscreen" : ""}`}>
+    <main className={`app-shell ${detailsPanelCollapsed ? "details-panel-collapsed" : ""} ${portalEditorFullscreen ? "portal-editor-fullscreen" : ""} ${ruleEditorFullscreen ? "rule-editor-fullscreen" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-logo" src="/brand/sh-gerenciamento.png" alt="SH Gerenciamento" />
@@ -1066,6 +1036,10 @@ export default function Home() {
             <MaterialIcon name="stacks" size={18} />
             Regras
           </button>
+          <button className={`nav-item ${activeView === "automations" ? "selected" : ""}`} type="button" onClick={openAutomationsView}>
+            <MaterialIcon name="bolt" size={18} />
+            Automacoes
+          </button>
         </nav>
         <nav className="sidebar-nav sidebar-nav-bottom" aria-label="Status">
           <button className={`nav-item ${activeView === "status" ? "selected" : ""}`} type="button" onClick={openStatusView}>
@@ -1077,10 +1051,24 @@ export default function Home() {
 
       <section className="content">
         <header className="topbar">
-          <div>
-            <h1>{activeViewTitle}</h1>
+          <div className="topbar-heading">
+            <div className="topbar-title-row">
+              <h1>{activeViewTitle}</h1>
+              <button
+                className="ghost-button topbar-refresh-button"
+                type="button"
+                onClick={() => void loadAll()}
+                disabled={loading}
+                title="Atualizar dados"
+                aria-label="Atualizar dados"
+              >
+                {loading ? <Loader2 className="spin" size={17} /> : <MaterialIcon name="refresh" size={18} />}
+              </button>
+            </div>
             <p>
-              {metadata
+              {activeView === "automations"
+                ? `${formatNumber(automations.length)} automacoes - ${formatNumber(activeAutomations.length)} ativas`
+                : metadata
                 ? `${formatNumber(portals.length)} portais - ${formatNumber(rules.length)} regras - ${formatNumber(activeRules.length)} ativas - ${formatNumber(metadata.counts.base_imoveis)} imoveis - ${formatNumber(metadata.counts.publish_locks)} locks`
                 : "Carregando metadados"}
             </p>
@@ -1094,271 +1082,63 @@ export default function Home() {
                 placeholder={searchPlaceholder}
               />
             </div>
-            {activeView !== "status" ? (
+            {activeView === "portals" || activeView === "rules" ? (
             <button
-              className="secondary-button add-portal-button"
+              className={activeView === "rules" ? "primary-button topbar-primary-action new-rule-button" : "secondary-button add-portal-button"}
               type="button"
               onClick={activeView === "portals" ? newPortal : newRule}
             >
-              <MaterialIcon name="add" size={18} />
+              <MaterialIcon name={activeView === "rules" ? "add_circle" : "add"} size={activeView === "rules" ? 20 : 18} />
               {activeView === "portals" ? "Adicionar portal" : "Nova regra"}
             </button>
-            ) : (
+            ) : activeView === "status" ? (
             <button className="secondary-button add-portal-button" type="button" onClick={() => void loadRuleHealthchecks()} disabled={healthcheckLoading}>
               {healthcheckLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="refresh" size={18} />}
               Verificar ativas
             </button>
-            )}
-            <button className="secondary-button" type="button" onClick={() => void loadAll()} disabled={loading}>
-              <MaterialIcon name="refresh" size={18} />
-              Atualizar
-            </button>
+            ) : null}
           </div>
         </header>
 
         {error && <div className="error-banner">{error}</div>}
 
         {activeView === "portals" ? (
-        <section className="portal-directory">
-          <div className="portal-directory-heading">
-            <div>
-              <h2>Todos os portais</h2>
-              <span>{formatNumber(visiblePortals.length)} na listagem</span>
-            </div>
-          </div>
-
-          <div className="portal-table">
-            <div className="portal-row header">
-              <span>Portal</span>
-              <span>Cotas</span>
-              <span>Regras</span>
-              <span>Status</span>
-              <span></span>
-            </div>
-            {loading ? (
-              <div className="empty-state">
-                <Loader2 className="spin" size={18} /> Carregando
-              </div>
-            ) : visiblePortals.length ? (
-              visiblePortals.map((portal) => (
-                <button
-                  className={`portal-row ${portal.id === selectedPortalId ? "selected" : ""}`}
-                  key={portal.id}
-                  type="button"
-                  onClick={() => selectPortal(portal)}
-                >
-                  <span className="portal-cell">
-                    <span className="portal-logo">
-                      {portal.logo_url ? <img src={portal.logo_url} alt="" /> : <Globe2 size={18} />}
-                    </span>
-                    <span>
-                      <strong>{portal.name}</strong>
-                      <small>{portal.description || "Sem descricao"}</small>
-                    </span>
-                  </span>
-                  <span>{formatNumber(portal.total_quota ?? 0)}</span>
-                  <span>{formatNumber(portal.rules_count ?? 0)}</span>
-                  <span className={`status-pill ${portal.active ? "active" : "inactive"}`}>
-                    {portal.active ? "Ativo" : "Inativo"}
-                  </span>
-                  <span
-                    className="row-action"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      selectPortal(portal, "edit");
-                    }}
-                  >
-                    <MaterialIcon name="edit" size={17} />
-                    Editar
-                  </span>
-                </button>
-              ))
-            ) : (
-              <div className="empty-state">Nenhum portal encontrado.</div>
-            )}
-          </div>
-        </section>
+        <PortalDirectory
+          loading={loading}
+          portals={visiblePortals}
+          selectedPortalId={selectedPortalId}
+          onSelect={(portal) => selectPortal(portal)}
+          onEdit={(portal) => selectPortal(portal, "edit")}
+        />
+        ) : activeView === "automations" ? (
+        <AutomationDirectory
+          loading={loading}
+          automations={visibleAutomations}
+          selectedAutomationKey={selectedAutomationKey}
+          onSelect={(automation) => setSelectedAutomationKey(automation.key)}
+        />
         ) : activeView === "status" ? (
-        <section className="status-directory">
-          <div className="portal-directory-heading">
-            <div>
-              <h2>Regras ativas</h2>
-              <span>{formatNumber(visibleStatusRules.length)} monitoradas</span>
-            </div>
-          </div>
-
-          <div className="status-portal-groups">
-            {loading ? (
-              <div className="empty-state">
-                <Loader2 className="spin" size={18} /> Carregando
-              </div>
-            ) : statusPortalGroups.length ? (
-              statusPortalGroups.map((group) => {
-                const portalName = group.portal?.name ?? group.rules[0]?.portal_name ?? "Portal";
-                const portalSlug = group.portal?.slug ?? group.rules[0]?.portal_slug ?? "";
-                const errorCount = group.rules.filter((rule) => ruleHealthTone(rule) === "error").length;
-                const warningCount = group.rules.filter((rule) => ruleHealthTone(rule) === "warning").length;
-                const unknownCount = group.rules.filter((rule) => ruleHealthTone(rule) === "unknown").length;
-                const pendingTotal = group.rules.reduce((total, rule) => total + (rule.health_pending_count ?? 0), 0);
-                const unexpectedTotal = group.rules.reduce((total, rule) => total + (rule.health_unexpected_count ?? 0), 0);
-                const groupTone = errorCount ? "error" : warningCount ? "warning" : unknownCount ? "unknown" : "ok";
-
-                return (
-                  <section className={`status-portal-group ${groupTone}`} key={group.portalId}>
-                    <div className="status-portal-heading">
-                      <span className="portal-logo status-portal-logo">
-                        {group.portal?.logo_url ? <img src={group.portal.logo_url} alt="" /> : <Globe2 size={20} />}
-                      </span>
-                      <div className="status-portal-copy">
-                        <h3>{portalName}</h3>
-                        <span>{portalSlug || "Slug indisponivel"}</span>
-                      </div>
-                      <div className="status-portal-summary">
-                        <span>
-                          <small>Regras</small>
-                          <strong>{formatNumber(group.rules.length)}</strong>
-                        </span>
-                        <span>
-                          <small>Pendentes</small>
-                          <strong>{formatNumber(pendingTotal)}</strong>
-                        </span>
-                        <span>
-                          <small>Indevidos</small>
-                          <strong>{formatNumber(unexpectedTotal)}</strong>
-                        </span>
-                        <span>
-                          <small>Alertas</small>
-                          <strong>{formatNumber(errorCount + warningCount + unknownCount)}</strong>
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="status-rule-list status-portal-rules">
-                      {group.rules.map((rule) => (
-                        <button
-                          className={`status-rule-card ${ruleHealthTone(rule)} ${rule.id === selectedStatusRuleId ? "selected" : ""}`}
-                          key={rule.id}
-                          type="button"
-                          onClick={() => setSelectedStatusRuleId(rule.id)}
-                        >
-                          <span className="status-rule-main">
-                            <span className="portal-logo rule-node-icon">
-                              {group.portal?.logo_url || rule.portal_logo_url ? (
-                                <img src={group.portal?.logo_url ?? rule.portal_logo_url ?? ""} alt="" />
-                              ) : (
-                                <MaterialIcon name="monitor_heart" size={18} />
-                              )}
-                            </span>
-                            <span>
-                              <strong>{rule.name}</strong>
-                              <small>{rule.view_name ?? "View indisponivel"}</small>
-                            </span>
-                          </span>
-                          <span className="status-rule-metrics">
-                            <span>
-                              <small>Esperados</small>
-                              <strong>{rule.health_expected_count == null ? "-" : formatNumber(rule.health_expected_count)}</strong>
-                            </span>
-                            <span>
-                              <small>Publicados</small>
-                              <strong>{rule.health_published_count == null ? "-" : formatNumber(rule.health_published_count)}</strong>
-                            </span>
-                            <span>
-                              <small>Pendentes</small>
-                              <strong>{rule.health_pending_count == null ? "-" : formatNumber(rule.health_pending_count)}</strong>
-                            </span>
-                            <span>
-                              <small>Indevidos</small>
-                              <strong>{rule.health_unexpected_count == null ? "-" : formatNumber(rule.health_unexpected_count)}</strong>
-                            </span>
-                          </span>
-                          <span className={`healthcheck-badge ${ruleHealthTone(rule)}`}>
-                            {statusLabel(rule)}
-                          </span>
-                          {rule.health_error && <span className="status-rule-error">{rule.health_error}</span>}
-                        </button>
-                      ))}
-                    </div>
-                  </section>
-                );
-              })
-            ) : (
-              <div className="empty-state">Nenhuma regra ativa com portal vinculado encontrada.</div>
-            )}
-          </div>
-        </section>
+        <StatusDirectory
+          loading={loading}
+          groups={statusPortalGroups}
+          visibleRuleCount={visibleStatusRules.length}
+          selectedRuleId={selectedStatusRuleId}
+          onSelectRule={setSelectedStatusRuleId}
+        />
         ) : (
-        <section className="rule-directory">
-          <div className="portal-directory-heading">
-            <div>
-              <h2>Todas as regras</h2>
-              <span>{formatNumber(visibleRules.length)} na listagem</span>
-            </div>
-          </div>
-
-          <div className="rule-table">
-            <div className="rule-row header">
-              <span>Regra</span>
-              <span>Portal</span>
-              <span>Imoveis</span>
-              <span>Status</span>
-              <span></span>
-            </div>
-            {loading ? (
-              <div className="empty-state">
-                <Loader2 className="spin" size={18} /> Carregando
-              </div>
-            ) : ruleTreeRows.length ? (
-              ruleTreeRows.map(({ rule, depth }) => (
-                <button
-                  className={`rule-row nested-rule-row ${depth > 0 ? "child-rule-row" : ""} ${rule.id === ruleForm?.id ? "selected" : ""}`}
-                  key={rule.id}
-                  style={{ "--rule-indent": `${Math.min(depth, 6) * 24}px` } as CSSProperties}
-                  type="button"
-                  onClick={() => editRule(rule, "view")}
-                >
-                  <span className="portal-cell rule-name-cell">
-                    <span className="rule-tree-rail" aria-hidden="true" />
-                    <span className={`portal-logo rule-node-icon ${depth > 0 ? "child" : ""}`}>
-                      {portalById.get(rule.portal_id ?? -1)?.logo_url || rule.portal_logo_url ? (
-                        <img src={portalById.get(rule.portal_id ?? -1)?.logo_url ?? rule.portal_logo_url ?? ""} alt="" />
-                      ) : depth > 0 ? (
-                        <MaterialIcon name="account_tree" size={18} />
-                      ) : (
-                        <Filter size={18} />
-                      )}
-                    </span>
-                    <span className="rule-title-copy">
-                      <strong>{rule.name}</strong>
-                      <small>{rule.description || "Sem descricao"}</small>
-                    </span>
-                  </span>
-                  <span>{rule.portal_name ?? "Sem portal"}</span>
-                  <RuleCountCell rule={rule} />
-                  <span className={`status-pill ${rule.active ? "active" : "inactive"}`}>
-                    {rule.active ? "Ativa" : "Inativa"}
-                  </span>
-                  <span
-                    className="row-action"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      editRule(rule, "edit");
-                    }}
-                  >
-                    <MaterialIcon name="edit" size={17} />
-                    Editar
-                  </span>
-                </button>
-              ))
-            ) : (
-              <div className="empty-state">Nenhuma regra encontrada.</div>
-            )}
-          </div>
-        </section>
+        <RuleDirectory
+          loading={loading}
+          rows={ruleTreeRows}
+          visibleRuleCount={visibleRules.length}
+          selectedRuleId={ruleForm?.id}
+          portalById={portalById}
+          onSelect={(rule) => editRule(rule, "view")}
+          onEdit={(rule) => editRule(rule, "edit")}
+        />
         )}
       </section>
 
-      <aside className={`portal-editor-panel ${detailsPanelCollapsed && !ruleEditorFullscreen ? "collapsed" : ""}`}>
+      <aside className={`portal-editor-panel ${detailsPanelCollapsed && !detailsEditorFullscreen ? "collapsed" : ""}`}>
         <div className="details-panel-toggle-bar">
           <button
             className="icon-button details-panel-toggle"
@@ -1370,54 +1150,237 @@ export default function Home() {
             <MaterialIcon name={detailsPanelCollapsed ? "keyboard_double_arrow_left" : "keyboard_double_arrow_right"} size={19} />
           </button>
           {!detailsPanelCollapsed && (
-            <span>{activeView === "portals" ? "Detalhes do portal" : activeView === "status" ? "Status" : "Detalhes da regra"}</span>
+            <span>
+              {activeView === "portals"
+                ? "Detalhes do portal"
+                : activeView === "automations"
+                  ? "Detalhes da automacao"
+                  : activeView === "status"
+                    ? "Status"
+                    : "Detalhes da regra"}
+            </span>
           )}
         </div>
-        {!detailsPanelCollapsed && (activeView === "portals" ? (
-        <form className={`portal-form ${isPortalEditing ? "edit-mode" : "view-mode"}`} onSubmit={savePortal}>
-          {!isPortalEditing && (
-            <div className="panel-mode-actions">
-              <button className="secondary-button compact-button" type="button" onClick={() => setPortalMode("edit")}>
-                <MaterialIcon name="edit" size={17} />
-                Editar
-              </button>
+        {(detailsEditorFullscreen || !detailsPanelCollapsed) && (activeView === "portals" ? (
+        <form className={`portal-form ${isPortalEditing ? "edit-mode portal-edit-fullscreen" : "view-mode"}`} onSubmit={savePortal}>
+          {isPortalEditing ? (
+          <>
+          <div className="panel-heading inset rule-editor-heading portal-editor-heading">
+            <div className="rule-editor-heading-copy">
+              <span className="portal-logo rule-editor-logo">
+                {portalForm.logo_url ? <img src={portalForm.logo_url} alt="" /> : <Globe2 size={22} />}
+              </span>
+              <span>
+                <h2>{portalForm.id ? "Editar portal" : "Novo portal"}</h2>
+                <span>{portalForm.slug.trim() || "Configure o identificador do portal"}</span>
+              </span>
             </div>
-          )}
-          {isPortalEditing && portalForm.id && (
-            <div className="panel-mode-actions">
+            <div className="panel-heading-actions">
+              {portalForm.id && (
               <button className="secondary-button compact-button" type="button" onClick={returnToPortalView}>
                 <MaterialIcon name="arrow_back" size={17} />
                 Voltar
               </button>
+              )}
+              {portalForm.id && (
+              <button className="danger-button" type="button" onClick={() => void removePortal(portalForm.id!)}>
+                <MaterialIcon name="delete" size={18} />
+              </button>
+              )}
+              <button className="ghost-button compact-button" type="button" onClick={cancelPortalEdit}>
+                <MaterialIcon name="close" size={18} />
+                Cancelar
+              </button>
+              <button className="primary-button compact-button" type="submit" disabled={saving}>
+                {saving ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="check" size={18} />}
+                Salvar portal
+              </button>
             </div>
-          )}
+          </div>
+
+          <div className="portal-config-band">
+            <div className="rule-config-card portal-config-main-card">
+              <div className="rule-config-card-heading">
+                <span>Configuracao</span>
+                <small>Identificacao e marca</small>
+              </div>
+              <div className="portal-identity-grid">
+                <div className="logo-uploader portal-logo-uploader">
+                  <div className="logo-preview portal-logo-preview">
+                    {portalForm.logo_url ? <img src={portalForm.logo_url} alt="" /> : <Image size={28} />}
+                  </div>
+                  <label className="secondary-button logo-upload-button" htmlFor="portal-logo-upload">
+                    <MaterialIcon name="image" size={17} />
+                    Logo
+                  </label>
+                  <input id="portal-logo-upload" type="file" accept="image/*" onChange={updatePortalLogo} />
+                </div>
+
+                <label>
+                  Nome do portal
+                  <input
+                    value={portalForm.name}
+                    onChange={(event) => setPortalForm({ ...portalForm, name: event.target.value })}
+                    required
+                  />
+                </label>
+
+                <label>
+                  <span className="field-label-with-help">
+                    Slug
+                    <span className="field-help-icon" title={PORTAL_SLUG_HELP} aria-label={PORTAL_SLUG_HELP}>
+                      <MaterialIcon name="info" size={15} />
+                    </span>
+                  </span>
+                  <input
+                    value={portalForm.slug}
+                    pattern="[a-z0-9_]+"
+                    placeholder="grupo_zap"
+                    title="Use apenas letras minusculas, numeros e underscore."
+                    onChange={(event) => setPortalForm({ ...portalForm, slug: event.target.value })}
+                    required
+                  />
+                </label>
+
+                <label className="portal-description-field">
+                  Descricao
+                  <textarea
+                    value={portalForm.description ?? ""}
+                    onChange={(event) => setPortalForm({ ...portalForm, description: event.target.value })}
+                    rows={2}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="rule-config-card portal-config-toggle-card">
+              <div className="rule-config-card-heading">
+                <span>Operacao</span>
+                <small>Status e volume</small>
+              </div>
+              <div className="portal-metrics-grid">
+                <div className="summary-status">
+                  <span>Cotas</span>
+                  <strong>{formatNumber(portalFormTotal)}</strong>
+                </div>
+                <div className="summary-status">
+                  <span>Regras</span>
+                  <strong>{formatNumber(selectedPortalRules.length)}</strong>
+                </div>
+                <label className="toggle-field portal-status-toggle">
+                  <input
+                    type="checkbox"
+                    checked={portalForm.active}
+                    onChange={(event) => setPortalForm({ ...portalForm, active: event.target.checked })}
+                  />
+                  <span className="toggle-switch" aria-hidden="true" />
+                  <span>
+                    <strong>Status</strong>
+                    <small>{portalForm.active ? "Ativo" : "Inativo"}</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div className="rule-editor-section-divider portal-editor-divider" aria-hidden="true" />
+
+          <section className="rule-editor-panel portal-editor-quota-panel">
+            <div className="rule-editor-panel-title">
+              <MaterialIcon name="sell" size={42} />
+              <span>Tipos de anuncio</span>
+            </div>
+            <div className="filter-editor-card portal-ad-types-card">
+              <div className="filter-editor-heading portal-ad-types-heading">
+                <div>
+                  <h3>Cotas do portal</h3>
+                  <span>{formatNumber(portalForm.ad_types.length)} tipos - {formatNumber(portalFormTotal)} cotas</span>
+                </div>
+                <button className="secondary-button compact-button" type="button" onClick={addPortalAdType}>
+                  <MaterialIcon name="add" size={18} />
+                  Tipo
+                </button>
+              </div>
+
+              <div className="portal-ad-type-list">
+                {orderedPortalFormAdTypes.map(({ adType, index }) => (
+                  <div className="portal-ad-type-row" key={index}>
+                    <label className="portal-ad-type-name-field">
+                      Tipo
+                      <input
+                        value={adType.name}
+                        placeholder="Padrao"
+                        title={AD_TYPE_NAME_HELP}
+                        aria-label={AD_TYPE_NAME_HELP}
+                        onChange={(event) => updatePortalAdType(index, { name: event.target.value })}
+                      />
+                    </label>
+                    <label>
+                      Cota
+                      <NumericInput
+                        allowDecimal={false}
+                        allowNegative={false}
+                        value={adType.quantity}
+                        placeholder="Qtd."
+                        onValueChange={(value) => updatePortalAdType(index, { quantity: localizedNumberToNumber(value) })}
+                      />
+                    </label>
+                    <label>
+                      <span className="field-label-with-help">
+                        Tier
+                        <span className="field-help-icon" title={AD_TIER_HELP} aria-label={AD_TIER_HELP}>
+                          <MaterialIcon name="info" size={14} />
+                        </span>
+                      </span>
+                      <NumericInput
+                        allowDecimal={false}
+                        allowNegative={false}
+                        min={1}
+                        max={10}
+                        value={adType.tier}
+                        placeholder="Tier"
+                        onValueChange={(value) => updatePortalAdType(index, { tier: normalizeAdTier(localizedNumberToNumber(value)) })}
+                      />
+                    </label>
+                    <button
+                      className="danger-button portal-ad-type-remove"
+                      type="button"
+                      title="Remover tipo"
+                      aria-label="Remover tipo"
+                      onClick={() =>
+                        setPortalForm({
+                          ...portalForm,
+                          ad_types: portalForm.ad_types.filter((_, itemIndex) => itemIndex !== index)
+                        })
+                      }
+                    >
+                      <MaterialIcon name="delete" size={18} />
+                    </button>
+                  </div>
+                ))}
+                {!portalForm.ad_types.length && <div className="quota-empty portal-empty-state">Sem tipos cadastrados.</div>}
+              </div>
+            </div>
+          </section>
+          </>
+          ) : (
+          <>
+          <div className="panel-mode-actions">
+            <button className="secondary-button compact-button" type="button" onClick={() => setPortalMode("edit")}>
+              <MaterialIcon name="edit" size={17} />
+              Editar
+            </button>
+          </div>
           <div className="portal-editor-header">
             <div className="logo-uploader">
               <div className="logo-preview">
                 {portalForm.logo_url ? <img src={portalForm.logo_url} alt="" /> : <Image size={26} />}
               </div>
-              {isPortalEditing && (
-              <>
-              <label className="secondary-button logo-upload-button" htmlFor="portal-logo-upload">
-                <MaterialIcon name="image" size={17} />
-                Logo
-              </label>
-              <input id="portal-logo-upload" type="file" accept="image/*" onChange={updatePortalLogo} />
-              </>
-              )}
             </div>
             <div className="portal-title-fields">
               <label>
                 Nome do portal
-                {isPortalEditing ? (
-                <input
-                  value={portalForm.name}
-                  onChange={(event) => setPortalForm({ ...portalForm, name: event.target.value })}
-                  required
-                />
-                ) : (
-                  <span className="view-field">{displayValue(portalForm.name)}</span>
-                )}
+                <span className="view-field">{displayValue(portalForm.name)}</span>
               </label>
               <label>
                 <span className="field-label-with-help">
@@ -1426,30 +1389,11 @@ export default function Home() {
                     <MaterialIcon name="info" size={15} />
                   </span>
                 </span>
-                {isPortalEditing ? (
-                <input
-                  value={portalForm.slug}
-                  pattern="[a-z0-9_]+"
-                  placeholder="grupo_zap"
-                  title="Use apenas letras minusculas, numeros e underscore."
-                  onChange={(event) => setPortalForm({ ...portalForm, slug: event.target.value })}
-                  required
-                />
-                ) : (
-                  <span className="view-field code-view-field portal-slug-view">{displayValue(portalForm.slug)}</span>
-                )}
+                <span className="view-field code-view-field portal-slug-view">{displayValue(portalForm.slug)}</span>
               </label>
               <label>
                 Descricao
-                {isPortalEditing ? (
-                <textarea
-                  value={portalForm.description ?? ""}
-                  onChange={(event) => setPortalForm({ ...portalForm, description: event.target.value })}
-                  rows={2}
-                />
-                ) : (
-                  <span className="view-field multiline">{displayValue(portalForm.description)}</span>
-                )}
+                <span className="view-field multiline">{displayValue(portalForm.description)}</span>
               </label>
             </div>
           </div>
@@ -1463,25 +1407,10 @@ export default function Home() {
               <span>Regras</span>
               <strong>{formatNumber(selectedPortalRules.length)}</strong>
             </div>
-            {isPortalEditing ? (
-            <label className="toggle-field summary-toggle">
-              <input
-                type="checkbox"
-                checked={portalForm.active}
-                onChange={(event) => setPortalForm({ ...portalForm, active: event.target.checked })}
-              />
-              <span className="toggle-switch" aria-hidden="true" />
-              <span>
-                <strong>Status</strong>
-                <small>{portalForm.active ? "Ativo" : "Inativo"}</small>
-              </span>
-            </label>
-            ) : (
-              <div className="summary-status">
-                <span>Status</span>
-                <strong>{portalForm.active ? "Ativo" : "Inativo"}</strong>
-              </div>
-            )}
+            <div className="summary-status">
+              <span>Status</span>
+              <strong>{portalForm.active ? "Ativo" : "Inativo"}</strong>
+            </div>
           </div>
 
           <div className="quota-editor">
@@ -1491,83 +1420,131 @@ export default function Home() {
             </div>
             <div className="quota-list">
               {orderedPortalFormAdTypes.map(({ adType, index }) => (
-                <div className={`quota-row ${isPortalEditing ? "" : "view-row"}`} key={index}>
-                  {isPortalEditing ? (
-                  <>
-                  <input
-                    value={adType.name}
-                    placeholder="Tipo"
-                    onChange={(event) => updatePortalAdType(index, { name: event.target.value })}
-                  />
-                  <NumericInput
-                    allowDecimal={false}
-                    allowNegative={false}
-                    value={adType.quantity}
-                    placeholder="Qtd."
-                    onValueChange={(value) => updatePortalAdType(index, { quantity: localizedNumberToNumber(value) })}
-                  />
-                  <span className="quota-tier-field">
-                    <NumericInput
-                      allowDecimal={false}
-                      allowNegative={false}
-                      min={1}
-                      max={10}
-                      value={adType.tier}
-                      placeholder="Tier"
-                      onValueChange={(value) => updatePortalAdType(index, { tier: normalizeAdTier(localizedNumberToNumber(value)) })}
-                    />
-                    <span className="field-help-icon quota-tier-help" title={AD_TIER_HELP} aria-label={AD_TIER_HELP}>
-                      <MaterialIcon name="info" size={14} />
-                    </span>
-                  </span>
-                  <button
-                    className="icon-button"
-                    type="button"
-                    title="Remover tipo"
-                    onClick={() =>
-                      setPortalForm({
-                        ...portalForm,
-                        ad_types: portalForm.ad_types.filter((_, itemIndex) => itemIndex !== index)
-                      })
-                    }
-                  >
-                    <MaterialIcon name="close" size={17} />
-                  </button>
-                  </>
-                  ) : (
-                    <>
-                      <span className="view-field">{displayValue(adType.name)}</span>
-                      <span className="view-field number">{formatNumber(adType.quantity || 0)}</span>
-                      <span className="view-field number">{formatNumber(adType.tier)}</span>
-                    </>
-                  )}
+                <div className="quota-row view-row" key={index}>
+                  <span className="view-field">{displayValue(adType.name)}</span>
+                  <span className="view-field number">{formatNumber(adType.quantity || 0)}</span>
+                  <span className="view-field number">{formatNumber(adType.tier)}</span>
                 </div>
               ))}
               {!portalForm.ad_types.length && <div className="quota-empty">Sem tipos cadastrados.</div>}
             </div>
-            {isPortalEditing && (
-            <button className="secondary-button full-width" type="button" onClick={addPortalAdType}>
-              <MaterialIcon name="add" size={18} />
-              Tipo de anuncio
-            </button>
-            )}
           </div>
-
-          {isPortalEditing && (
-          <div className="form-actions">
-            <button className="primary-button" type="submit" disabled={saving}>
-              <MaterialIcon name="save" size={18} />
-              Salvar portal
-            </button>
-            {portalForm.id && (
-              <button className="danger-button" type="button" onClick={() => void removePortal(portalForm.id!)}>
-                <MaterialIcon name="delete" size={18} />
-              </button>
-            )}
-          </div>
+          </>
           )}
         </form>
 
+        ) : activeView === "automations" ? (
+          <section className="status-side-panel automation-side-panel">
+            <div className="panel-heading inset">
+              <div>
+                <h2>{selectedAutomation ? selectedAutomation.name : "Automacoes"}</h2>
+                <span>
+                  {selectedAutomation
+                    ? `${selectedAutomation.schema_name}.${selectedAutomation.table_name}.${selectedAutomation.target_column}`
+                    : `${formatNumber(automations.length)} cadastradas`}
+                </span>
+              </div>
+              {selectedAutomation && (
+                <div className="panel-heading-actions">
+                  <button
+                    className="danger-button compact-button"
+                    type="button"
+                    onClick={() => void removeAutomation(selectedAutomation)}
+                    disabled={saving}
+                  >
+                    <MaterialIcon name="delete" size={17} />
+                    Excluir
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {selectedAutomation ? (
+              <>
+                <div className="status-detail-card automation-detail-card">
+                  <div className="status-detail-title">
+                    <span className={`status-pill ${selectedAutomation.active ? "active" : "inactive"}`}>
+                      {selectedAutomation.active ? "Ativa" : "Inativa"}
+                    </span>
+                    <span>{selectedAutomation.key}</span>
+                  </div>
+
+                  <div className="healthcheck-grid status-detail-grid automation-detail-grid">
+                    <div>
+                      <span>Base</span>
+                      <strong>{selectedAutomation.database_name}</strong>
+                    </div>
+                    <div>
+                      <span>Tabela</span>
+                      <strong>{`${selectedAutomation.schema_name}.${selectedAutomation.table_name}`}</strong>
+                    </div>
+                    <div>
+                      <span>Coluna</span>
+                      <strong>{selectedAutomation.target_column}</strong>
+                    </div>
+                    <div>
+                      <span>Modo</span>
+                      <strong>{selectedAutomation.run_mode === "trigger_db" ? "Trigger DB" : selectedAutomation.run_mode}</strong>
+                    </div>
+                    <div>
+                      <span>Ultima execucao</span>
+                      <strong>{selectedAutomation.last_run_at ? formatTimestamp(selectedAutomation.last_run_at) : "-"}</strong>
+                    </div>
+                    <div>
+                      <span>Afetados</span>
+                      <strong>
+                        {selectedAutomation.last_affected_count == null ? "-" : formatNumber(selectedAutomation.last_affected_count)}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <label className="toggle-field automation-status-toggle">
+                    <input
+                      type="checkbox"
+                      checked={selectedAutomation.active}
+                      disabled={saving}
+                      onChange={(event) => void updateAutomationActive(selectedAutomation, event.target.checked)}
+                    />
+                    <span className="toggle-switch" aria-hidden="true" />
+                    <span>
+                      <strong>Automacao</strong>
+                      <small>{selectedAutomation.active ? "Ativa" : "Inativa"}</small>
+                    </span>
+                  </label>
+                </div>
+
+                <div className="status-query-card automation-query-card">
+                  <div className="status-query-title-row">
+                    <div className="status-query-heading">
+                      <span>SQL da automacao</span>
+                      <strong>{selectedAutomation.function_name ?? selectedAutomation.trigger_name ?? selectedAutomation.key}</strong>
+                    </div>
+                    <button className="ghost-button compact-button" type="button" onClick={() => void copyAutomationSql()}>
+                      <MaterialIcon name={automationSqlCopied ? "done" : "content_copy"} size={17} />
+                      {automationSqlCopied ? "Copiado" : "Copiar"}
+                    </button>
+                  </div>
+                  <pre>{selectedAutomation.sql_text}</pre>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="healthcheck-grid status-summary-grid">
+                  <div className="ok">
+                    <span>Ativas</span>
+                    <strong>{formatNumber(activeAutomations.length)}</strong>
+                  </div>
+                  <div className="unknown">
+                    <span>Inativas</span>
+                    <strong>{formatNumber(automations.length - activeAutomations.length)}</strong>
+                  </div>
+                </div>
+                <div className="healthcheck-message ok">
+                  Selecione uma automacao para ver detalhes e SQL.
+                </div>
+              </>
+            )}
+          </section>
         ) : activeView === "status" ? (
           <section className="status-side-panel">
             <div className="panel-heading inset">
@@ -1642,7 +1619,7 @@ export default function Home() {
                 <div className="status-query-card">
                   <div className="status-query-heading">
                     <span>Query de publicados indevidos</span>
-                    <strong>imoveis_ativos fora da regra</strong>
+                    <strong>Fora da view final</strong>
                   </div>
                   <pre>{buildStatusUnexpectedQuery(selectedStatusRule)}</pre>
                 </div>
@@ -1781,19 +1758,14 @@ export default function Home() {
                 <label>
                   Preset inicial
                   {isRuleEditing ? (
-                  <select
-                    value={ruleForm.source_table}
-                    onChange={(event) => updateRuleSource(event.target.value)}
-                  >
-                    {ruleSourceOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                    <SourceViewPicker
+                      options={ruleSourceOptions}
+                      value={ruleForm.source_table}
+                      onSelect={updateRuleSource}
+                    />
                   ) : (
                     <span className="view-field">
-                      {displayValue(ruleSourceOptions.find((option) => option.value === ruleForm.source_table)?.label ?? ruleForm.source_table)}
+                      {displayValue(sourceViewDisplayLabel(ruleSourceOptions.find((option) => option.value === ruleForm.source_table)) ?? ruleForm.source_table)}
                     </span>
                   )}
                 </label>
@@ -2024,8 +1996,8 @@ export default function Home() {
                   <strong>{previewCount == null ? "-" : formatNumber(previewCount)}</strong>
                 </div>
                 {isRuleEditing && (
-                <button className="secondary-button" type="button" onClick={() => void previewRule()} disabled={saving}>
-                  <MaterialIcon name="visibility" size={18} />
+                <button className="secondary-button" type="button" onClick={() => void previewRule()} disabled={previewCountLoading}>
+                  {previewCountLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="visibility" size={18} />}
                   Calcular
                 </button>
                 )}
@@ -2043,117 +2015,27 @@ export default function Home() {
 
               <div className="rule-editor-section-divider rule-editor-summary-divider" aria-hidden="true" />
 
-              <section className="preview-rows-card">
-                <div className="preview-rows-heading">
-                  <div>
-                    <h3>Linhas do filtro</h3>
-                    <span>
-                      {previewRows
-                        ? `${formatNumber(previewRows.rows.length)} linha${previewRows.rows.length === 1 ? "" : "s"}`
-                        : "codigo_crm e campos filtrados"}
-                    </span>
-                  </div>
-                  <div className="preview-rows-actions">
-                    <div className="preview-sort-controls">
-                      <label className="preview-sort-select-wrap">
-                        <ListOrdered size={15} />
-                        <select
-                          aria-label="Coluna para ordenar a pre visualizacao"
-                          value={previewSortColumn}
-                          onChange={(event) => {
-                            const sortColumn = event.target.value;
-                            setPreviewSortColumn(sortColumn);
-                            if (previewRows) void previewRuleRows({ sortColumn });
-                          }}
-                          disabled={!previewRows?.columns.length}
-                        >
-                          <option value={PREVIEW_RULE_ORDER_COLUMN}>Ordem da regra</option>
-                          {previewRows?.columns.map((column) => (
-                            <option key={column.key} value={column.key}>
-                              {column.label}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <button
-                        className={`preview-sort-direction ${previewSortDirection}`}
-                        type="button"
-                        aria-label={`Ordenar em ordem ${previewSortDirection === "asc" ? "crescente" : "decrescente"}`}
-                        title={`Ordem ${previewSortDirection === "asc" ? "crescente" : "decrescente"}`}
-                        disabled={previewRowsLoading}
-                        onClick={() => {
-                          const sortDirection = previewSortDirection === "asc" ? "desc" : "asc";
-                          setPreviewSortDirection(sortDirection);
-                          if (previewRows) void previewRuleRows({ sortDirection });
-                        }}
-                      >
-                        {previewSortDirection === "asc" ? <ArrowUpAZ size={16} /> : <ArrowDownAZ size={16} />}
-                        <span>{previewSortDirection === "asc" ? "Asc" : "Desc"}</span>
-                      </button>
-                    </div>
-                    <div className="segmented preview-limit-toggle" aria-label="Quantidade de linhas">
-                      <button
-                        className={previewRowsLimit === 10 ? "selected" : ""}
-                        type="button"
-                        onClick={() => {
-                          setPreviewRowsLimit(10);
-                          setPreviewRows(null);
-                        }}
-                      >
-                        {formatNumber(10)}
-                      </button>
-                      <button
-                        className={previewRowsLimit === 100 ? "selected" : ""}
-                        type="button"
-                        onClick={() => {
-                          setPreviewRowsLimit(100);
-                          setPreviewRows(null);
-                        }}
-                      >
-                        {formatNumber(100)}
-                      </button>
-                    </div>
-                    <button className="secondary-button compact-button" type="button" onClick={() => void previewRuleRows()} disabled={previewRowsLoading}>
-                      {previewRowsLoading ? <Loader2 className="spin" size={16} /> : <MaterialIcon name="table_rows" size={17} />}
-                      Pre visualizar
-                    </button>
-                  </div>
-                </div>
-
-                {previewRows ? (
-                  previewRows.rows.length ? (
-                    <div className="preview-rows-table-wrap">
-                      <table className="preview-rows-table">
-                        <thead>
-                          <tr>
-                            {previewRows.columns.map((column) => (
-                              <th key={column.key}>{column.label}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {previewRows.rows.map((row, rowIndex) => (
-                            <tr key={rowIndex}>
-                              {previewRows.columns.map((column) => {
-                                const value = displayPreviewValue(row[column.key], column);
-                                return (
-                                  <td key={column.key} title={value}>
-                                    {value}
-                                  </td>
-                                );
-                              })}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="empty-state compact-empty preview-rows-empty">Nenhuma linha encontrada.</div>
-                  )
-                ) : (
-                  <div className="empty-state compact-empty preview-rows-empty">Pre visualize 10 ou 100 linhas.</div>
-                )}
-              </section>
+              <RulePreviewRows
+                previewRows={previewRows}
+                previewRowsLimit={previewRowsLimit}
+                previewRowsLoading={previewRowsLoading}
+                previewSortColumn={previewSortColumn}
+                previewSortDirection={previewSortDirection}
+                onSortColumnChange={(sortColumn) => {
+                  setPreviewSortColumn(sortColumn);
+                  if (previewRows) void previewRuleRows({ sortColumn });
+                }}
+                onSortDirectionChange={(sortDirection) => {
+                  setPreviewSortDirection(sortDirection);
+                  if (previewRows) void previewRuleRows({ sortDirection });
+                }}
+                onLimitChange={(limit) => {
+                  setPreviewRowsLimit(limit);
+                  setPreviewRows(null);
+                  if (previewRowsAutoRefreshRef.current) void previewRuleRows({ limit });
+                }}
+                onPreview={() => void previewRuleRows()}
+              />
 
                 </section>
               </div>
@@ -2229,8 +2111,8 @@ export default function Home() {
                 <h2>Regras</h2>
                 <span>Selecione uma regra ou crie uma nova.</span>
               </div>
-              <button className="secondary-button" type="button" onClick={newRule}>
-                <MaterialIcon name="add" size={18} />
+              <button className="primary-button topbar-primary-action new-rule-button" type="button" onClick={newRule}>
+                <MaterialIcon name="add_circle" size={20} />
                 Nova regra
               </button>
             </div>
@@ -2239,4 +2121,93 @@ export default function Home() {
       </aside>
     </main>
   );
+}
+
+function baseSourceViewOption(): SourceViewOption {
+  return {
+    value: "base_imoveis",
+    ruleName: "Base principal",
+    viewName: "base_imoveis",
+    groupId: "base",
+    groupLabel: "Origem principal",
+    groupDetail: "Tabela base para novas regras",
+    groupIcon: "table_view",
+    badge: "base"
+  };
+}
+
+function buildSourceViewOption(
+  viewName: string,
+  viewType: "view" | "materialized",
+  rule: PublicationRule | undefined,
+  portalById: Map<number, Portal>
+): SourceViewOption {
+  if (!rule) {
+    return {
+      value: viewName,
+      ruleName: viewName,
+      viewName,
+      groupId: "technical",
+      groupLabel: "Views tecnicas",
+      groupDetail: "Views sem regra cadastrada",
+      groupIcon: "schema",
+      badge: sourceViewBadge(viewType)
+    };
+  }
+
+  const portal = rule.portal_id == null ? null : portalById.get(rule.portal_id) ?? null;
+  const portalName = portal?.name ?? rule.portal_name ?? "Sem portal";
+  const portalSlug = portal?.slug ?? rule.portal_slug;
+
+  return {
+    value: viewName,
+    ruleName: rule.name,
+    viewName,
+    groupId: rule.portal_id == null ? "no-portal" : `portal:${rule.portal_id}`,
+    groupLabel: portalName,
+    groupDetail: portalSlug ? `Portal ${portalSlug}` : rule.portal_id == null ? "Regras sem portal vinculado" : "Regras deste portal",
+    groupIcon: rule.portal_id == null ? "link_off" : "public",
+    badge: sourceViewBadge(viewType)
+  };
+}
+
+function unavailableSourceViewOption(viewName: string): SourceViewOption {
+  return {
+    value: viewName,
+    ruleName: viewName,
+    viewName,
+    groupId: "unavailable",
+    groupLabel: "Indisponiveis",
+    groupDetail: "Origem salva, mas nao retornada pelo banco",
+    groupIcon: "warning",
+    badge: "off",
+    unavailable: true
+  };
+}
+
+function compareSourceViewOptions(left: SourceViewOption, right: SourceViewOption) {
+  const groupOrder = sourceViewGroupOrder(left) - sourceViewGroupOrder(right);
+  if (groupOrder) return groupOrder;
+
+  const groupNameOrder = left.groupLabel.localeCompare(right.groupLabel, "pt-BR");
+  if (groupNameOrder) return groupNameOrder;
+
+  return left.ruleName.localeCompare(right.ruleName, "pt-BR");
+}
+
+function sourceViewGroupOrder(option: SourceViewOption) {
+  if (option.groupId.startsWith("portal:")) return 1;
+  if (option.groupId === "no-portal") return 2;
+  if (option.groupId === "technical") return 3;
+  if (option.groupId === "unavailable") return 4;
+  return 0;
+}
+
+function sourceViewBadge(viewType: "view" | "materialized") {
+  return viewType === "materialized" ? "mat" : "view";
+}
+
+function sourceViewDisplayLabel(option: SourceViewOption | undefined) {
+  if (!option) return null;
+  return option.ruleName === option.viewName ? option.viewName : `${option.ruleName} (${option.viewName})`;
 }

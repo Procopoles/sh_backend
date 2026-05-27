@@ -23,6 +23,26 @@ export type Portal = {
   ad_types?: PortalAdType[];
 };
 
+export type PublishAutomation = {
+  key: string;
+  name: string;
+  description: string | null;
+  database_name: string;
+  schema_name: string;
+  table_name: string;
+  target_column: string;
+  run_mode: string;
+  active: boolean;
+  sql_text: string;
+  trigger_name: string | null;
+  function_name: string | null;
+  last_run_at: string | null;
+  last_affected_count: number | null;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type RuleCondition = {
   column: string;
   jsonPath?: string[] | null;

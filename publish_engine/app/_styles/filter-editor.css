@@ -490,8 +490,15 @@ code,
   min-width: 0;
 }
 
+.column-picker-option > span:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .column-picker-trigger-text strong,
 .column-picker-option strong {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -499,8 +506,10 @@ code,
 
 .column-picker-trigger-text small,
 .column-picker-option small {
-  color: var(--muted);
+  color: #7f8ea3;
+  display: block;
   font-size: 11px;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

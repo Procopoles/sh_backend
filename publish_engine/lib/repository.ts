@@ -22,6 +22,7 @@ import type {
   ColumnMetadata,
   Portal,
   PortalAdType,
+  PublishAutomation,
   PublicationPriority,
   PublicationRule,
   RuleHealthcheckReport,
@@ -91,6 +92,10 @@ const FINAL_VIEW_AD_TYPE_NAME_COLUMN = "ad_type_name";
 const FINAL_VIEW_AD_TYPE_SLUG_COLUMN = "ad_type_slug";
 const FINAL_VIEW_TIER_COLUMN = "tier";
 const FINAL_VIEW_PUBLICATION_RANK_COLUMN = "publication_rank";
+const FINAL_VIEW_STATUS_COLUMN = "status";
+const FINAL_VIEW_CURRENT_PUBLICATION_COLUMN = "current_publication";
+const FINAL_VIEW_PUBLISHED_STATUS = "published";
+const FINAL_VIEW_PENDING_STATUS = "pending";
 const FINAL_VIEW_REQUIRED_COLUMNS = ["codigo_crm", "publicacao_portais"];
 const FINAL_VIEW_RESERVED_COLUMNS = new Set([
   RULE_INDEX_COLUMN,
@@ -103,7 +108,9 @@ const FINAL_VIEW_RESERVED_COLUMNS = new Set([
   FINAL_VIEW_AD_TYPE_NAME_COLUMN,
   FINAL_VIEW_AD_TYPE_SLUG_COLUMN,
   FINAL_VIEW_TIER_COLUMN,
-  FINAL_VIEW_PUBLICATION_RANK_COLUMN
+  FINAL_VIEW_PUBLICATION_RANK_COLUMN,
+  FINAL_VIEW_STATUS_COLUMN,
+  FINAL_VIEW_CURRENT_PUBLICATION_COLUMN
 ]);
 
 let dataApiColumnsCache: { expiresAt: number; columns: ColumnMetadata[] } | null = null;
@@ -221,6 +228,65 @@ export async function deletePortal(id: number) {
     await client.query("delete from publish_portals where id = $1", [id]);
   });
   invalidateHealthcheckReportCache();
+}
+
+export async function listAutomations() {
+  if (isDataApiConfigured()) return listAutomationsViaApi();
+
+  await ensureControlSchema();
+  const result = await query<PublishAutomation>(`
+    select *
+    from publish_automations
+    where deleted_at is null
+    order by name asc, key asc
+  `);
+  return result.rows;
+}
+
+export async function updateAutomationActive(key: string, active: boolean) {
+  if (isDataApiConfigured()) return updateAutomationActiveViaApi(key, active);
+
+  await ensureControlSchema();
+  const automation = await withTransaction(async (client) => {
+    const updated = await client.query<PublishAutomation>(
+      `
+        update publish_automations
+        set active = $2,
+            updated_at = now()
+        where key = $1
+          and deleted_at is null
+        returning *
+      `,
+      [key, active]
+    );
+    if (!updated.rows[0]) return null;
+
+    if (active) {
+      await client.query("select * from public.publish_apply_automation($1)", [key]);
+    }
+
+    return getAutomationByKey(client, key);
+  });
+  return automation;
+}
+
+export async function deleteAutomation(key: string) {
+  if (isDataApiConfigured()) return deleteAutomationViaApi(key);
+
+  await ensureControlSchema();
+  const result = await query<PublishAutomation>(
+    `
+      update publish_automations
+      set active = false,
+          deleted_at = coalesce(deleted_at, now()),
+          updated_at = now()
+      where key = $1
+        and deleted_at is null
+      returning *
+    `,
+    [key]
+  );
+  return result.rows[0] ?? null;
 }
 
 export async function listRules(portalId?: number) {
@@ -464,6 +530,7 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
   await ensureControlSchema();
   const client = await getPool().connect();
   try {
+    await client.query("begin");
     const result = await client.query<
       Pick<
         PublicationRule,
@@ -480,12 +547,18 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
       ruleId ? [ruleId] : []
     );
 
+    await refreshFinalViewsForHealthcheck(client, result.rows);
+
     const statuses: RuleHealthcheckStatus[] = [];
     for (const rule of result.rows) {
       statuses.push(await runSingleRuleHealthcheck(client, rule));
     }
+    await client.query("commit");
     invalidateHealthcheckReportCache(ruleId);
     return statuses;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
   } finally {
     client.release();
   }
@@ -494,6 +567,10 @@ async function runRuleHealthchecksDirect(ruleId?: number | null): Promise<RuleHe
 export async function getRuleHealthcheckReport(options: { ruleId?: number | null; refresh?: boolean } = {}): Promise<RuleHealthcheckReport> {
   const ruleId = normalizeOptionalPositiveInteger(options.ruleId);
   if (isDataApiConfigured()) return getRuleHealthcheckReportViaApi(ruleId, Boolean(options.refresh));
+
+  if (options.refresh) {
+    await runRuleHealthchecks(ruleId);
+  }
 
   await ensureControlSchema();
   const result = await query<HealthcheckReportRuleRow>(
@@ -554,6 +631,17 @@ export async function getRuleHealthcheckReport(options: { ruleId?: number | null
     },
     rules
   };
+}
+
+async function refreshFinalViewsForHealthcheck(client: PoolClient, rules: Array<Pick<HealthcheckRuleRow, "portal_id">>) {
+  const portalIds = new Set<number>();
+  for (const rule of rules) {
+    if (rule.portal_id) portalIds.add(rule.portal_id);
+  }
+
+  for (const portalId of portalIds) {
+    await refreshPortalFinalView(client, portalId);
+  }
 }
 
 export async function previewRule(input: RuleInput) {
@@ -1116,6 +1204,50 @@ async function listPortalsViaApi() {
   });
 }
 
+async function listAutomationsViaApi() {
+  return dataApiRequest<PublishAutomation[]>("/publish_automations?deleted_at=is.null&order=name.asc,key.asc");
+}
+
+async function updateAutomationActiveViaApi(key: string, active: boolean) {
+  const updated = await dataApiRequest<PublishAutomation[]>(
+    `/publish_automations?key=eq.${encodeURIComponent(key)}&deleted_at=is.null`,
+    {
+      method: "PATCH",
+      prefer: "return=representation",
+      body: {
+        active,
+        updated_at: new Date().toISOString()
+      }
+    }
+  );
+  if (!updated[0]) return null;
+
+  if (active) {
+    await dataApiRpc("publish_apply_automation", { target_key: key });
+  }
+
+  const refreshed = await dataApiRequest<PublishAutomation[]>(
+    `/publish_automations?key=eq.${encodeURIComponent(key)}&deleted_at=is.null&limit=1`
+  );
+  return refreshed[0] ?? null;
+}
+
+async function deleteAutomationViaApi(key: string) {
+  const updated = await dataApiRequest<PublishAutomation[]>(
+    `/publish_automations?key=eq.${encodeURIComponent(key)}&deleted_at=is.null`,
+    {
+      method: "PATCH",
+      prefer: "return=representation",
+      body: {
+        active: false,
+        deleted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }
+    }
+  );
+  return updated[0] ?? null;
+}
+
 async function createPortalViaApi(input: PortalInput) {
   const slug = normalizePortalSlug(input.slug, input.name);
   const rows = await dataApiRequest<Portal[]>("/publish_portals", {
@@ -1325,6 +1457,11 @@ async function runRuleHealthchecksViaApi(ruleId?: number | null) {
 
 async function getRuleHealthcheckReportViaApi(ruleId: number | null, refresh: boolean): Promise<RuleHealthcheckReport> {
   const cacheKey = `data-api|${ruleId ?? "all"}`;
+  if (refresh) {
+    await runRuleHealthchecksViaApi(ruleId);
+    dataApiHealthcheckReportCache = null;
+  }
+
   if (!refresh && dataApiHealthcheckReportCache?.key === cacheKey && dataApiHealthcheckReportCache.expiresAt > Date.now()) {
     return {
       ...dataApiHealthcheckReportCache.value,
@@ -1423,6 +1560,20 @@ async function listBaseColumnsViaApi() {
   const columns = await dataApiRpc<ColumnMetadata[]>("publish_base_columns");
   dataApiColumnsCache = { columns, expiresAt: Date.now() + DATA_API_COLUMNS_CACHE_MS };
   return columns;
+}
+
+async function getAutomationByKey(client: PoolClient, key: string) {
+  const result = await client.query<PublishAutomation>(
+    `
+      select *
+      from publish_automations
+      where key = $1
+        and deleted_at is null
+      limit 1
+    `,
+    [key]
+  );
+  return result.rows[0] ?? null;
 }
 
 async function listPortalAdTypes(client: PoolClient, portalId: number) {
@@ -1785,7 +1936,7 @@ function sanitizeAdTypes(adTypes: Array<PortalAdTypeInput | PortalAdType>) {
   const normalized = new Map<string, { name: string; slug: string; quantity: number; tier: number }>();
   for (const [index, adType] of adTypes.entries()) {
     const name = normalizeAdTypeName(adType.name);
-    if (!name) continue;
+    if (!name.trim()) continue;
     const slug = normalizeAdTypeSlug(name);
 
     const quantity = Math.max(0, Math.trunc(Number(adType.quantity) || 0));
@@ -1812,11 +1963,11 @@ function sanitizeAdTypes(adTypes: Array<PortalAdTypeInput | PortalAdType>) {
 }
 
 function normalizeAdTypeName(name: string) {
-  return name.normalize("NFC").replace(/\s+/g, " ").trim().toLocaleLowerCase("pt-BR");
+  return name.normalize("NFC");
 }
 
 function normalizeAdTypeSlug(name: string) {
-  return slugify(normalizeAdTypeName(name));
+  return slugify(normalizeAdTypeName(name).replace(/\s+/g, " ").trim());
 }
 
 function normalizeAdTypeTier(value?: number | string | null) {
@@ -2087,38 +2238,102 @@ function quotedColumnList(columns: string[], alias?: string) {
 }
 
 function buildEmptyPortalFinalViewSql(viewName: string, columns: string[]) {
+  const outputColumns = portalFinalOutputColumns(columns);
   return `create materialized view public.${quoteIdentifier(viewName)} as
-select ${quotedColumnList(columns, "b")},
+select ${quotedColumnList(outputColumns, "b")},
   null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
   null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
   null::integer as ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
-  null::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)}
+  null::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)},
+  ${quoteLiteral(FINAL_VIEW_PUBLISHED_STATUS)}::text as ${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)},
+  b.${quoteIdentifier("publicacao_portais")}::jsonb as ${quoteIdentifier(FINAL_VIEW_CURRENT_PUBLICATION_COLUMN)}
 from public.base_imoveis b
 where false`;
 }
 
-function portalFinalAdTypeValuesSql(adTypes: PortalFinalAdType[]) {
-  return adTypes
+function portalFinalAdTypesCteSql(adTypes: PortalFinalAdType[]) {
+  if (!adTypes.length) {
+    return `select null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+    null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+    null::integer as ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+    null::integer as quantity
+  where false`;
+  }
+
+  return `values
+  ${adTypes
     .map((adType) => `(
     ${quoteLiteral(adType.ad_type_name)}::text,
     ${quoteLiteral(adType.ad_type_slug)}::text,
     ${Math.trunc(Number(adType.tier) || 0)}::integer,
     ${Math.max(0, Math.trunc(Number(adType.quantity) || 0))}::integer
   )`)
-    .join(",\n  ");
+    .join(",\n  ")}`;
+}
+
+function portalFinalOutputColumns(columns: string[]) {
+  return columns.filter((column) => column !== "publicacao_portais");
+}
+
+function portalPublishedFromSql(publicationSql: string, portalSlug: string) {
+  return `coalesce((${publicationSql} -> ${quoteLiteral(portalSlug)} ->> 'publicado')::boolean, false) is true`;
+}
+
+function portalPublicationTypeSlugFromSql(publicationSql: string, portalSlug: string) {
+  return `public.publish_publication_type_slug(${publicationSql}, ${quoteLiteral(portalSlug)})`;
+}
+
+function buildPortalFinalSelect(columns: string[]) {
+  const finalColumnSql = quotedColumnList(portalFinalOutputColumns(columns), "expected");
+  return `select ${finalColumnSql},
+  expected.${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+  expected.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+  expected.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+  expected.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)},
+  expected.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)},
+  expected.${quoteIdentifier(FINAL_VIEW_CURRENT_PUBLICATION_COLUMN)}
+from ${quoteIdentifier("expected_publications")} expected
+order by
+  case expected.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)}
+    when ${quoteLiteral(FINAL_VIEW_PENDING_STATUS)} then 0
+    when ${quoteLiteral(FINAL_VIEW_PUBLISHED_STATUS)} then 2
+    else 2
+  end,
+  expected.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)} asc nulls last,
+  expected.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc nulls last,
+  expected.${quoteIdentifier("codigo_crm")} asc`;
 }
 
 function buildPortalFinalViewSql(
   viewName: string,
+  portalSlug: string,
   candidateRules: PortalFinalCandidateRule[],
   adTypes: PortalFinalAdType[],
   columns: string[]
 ) {
-  if (!candidateRules.length || !adTypes.length) return buildEmptyPortalFinalViewSql(viewName, columns);
+  if (!candidateRules.length || !adTypes.length) {
+    return `create materialized view public.${quoteIdentifier(viewName)} as
+with ad_types(${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}, quantity) as (
+  ${portalFinalAdTypesCteSql(adTypes)}
+),
+${quoteIdentifier("expected_publications")} as (
+  select ${quotedColumnList(columns, "b")},
+    null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+    null::text as ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+    null::integer as ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+    null::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)},
+    ${quoteLiteral(FINAL_VIEW_PUBLISHED_STATUS)}::text as ${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)},
+    b.${quoteIdentifier("publicacao_portais")}::jsonb as ${quoteIdentifier(FINAL_VIEW_CURRENT_PUBLICATION_COLUMN)}
+  from public.base_imoveis b
+  where false
+)
+${buildPortalFinalSelect(columns)}`;
+  }
 
   const candidateColumnSql = quotedColumnList(columns, "b");
   const eligibleColumnSql = quotedColumnList(columns, "c");
-  const finalColumnSql = quotedColumnList(columns);
+  const rankedColumnSql = quotedColumnList(columns, "ranked");
+  const mergedPublicationSql = `coalesce(current_base.${quoteIdentifier("publicacao_portais")}::jsonb, ranked.${quoteIdentifier("publicacao_portais")}::jsonb)`;
   const candidateSql = candidateRules
     .map((rule, index) => {
       const ruleIndexSql = rule.has_rule_index
@@ -2147,7 +2362,8 @@ where b.codigo_crm is not null`;
   where d.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adType.ad_type_slug)}
     ${exclusions}
   order by d.${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
-    d.${quoteIdentifier("__allocation_rule_order")} asc
+    d.${quoteIdentifier("__allocation_rule_order")} asc,
+    d.${quoteIdentifier("codigo_crm")} asc
   limit ${Math.max(0, Math.trunc(Number(adType.quantity) || 0))}
 )`);
     allocatedNames.push(cteName);
@@ -2155,8 +2371,7 @@ where b.codigo_crm is not null`;
 
   return `create materialized view public.${quoteIdentifier(viewName)} as
 with ad_types(${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)}, quantity) as (
-  values
-  ${portalFinalAdTypeValuesSql(adTypes)}
+  ${portalFinalAdTypesCteSql(adTypes)}
 ),
 candidates as (
 ${candidateSql}
@@ -2195,24 +2410,37 @@ deduped as (
 ${allocatedCtes.join(",\n")},
 final_allocation as (
   ${allocatedNames.map((cteName) => `select * from ${quoteIdentifier(cteName)}`).join("\n  union all\n  ")}
+),
+${quoteIdentifier("ranked_expected")} as (
+  select final_allocation.*,
+    row_number() over (
+      order by ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc,
+        ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
+        ${quoteIdentifier("__allocation_rule_order")} asc,
+        ${quoteIdentifier("__allocation_match_rank")} asc,
+        ${quoteIdentifier("__allocation_tier_distance")} asc,
+        ${quoteIdentifier("codigo_crm")} asc
+    )::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)}
+  from final_allocation
+),
+${quoteIdentifier("expected_publications")} as (
+  select ${rankedColumnSql},
+    ranked.${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
+    ranked.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
+    ranked.${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
+    ranked.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)},
+    case
+      when ${portalPublishedFromSql(mergedPublicationSql, portalSlug)}
+       and ${portalPublicationTypeSlugFromSql(mergedPublicationSql, portalSlug)} = ranked.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}
+      then ${quoteLiteral(FINAL_VIEW_PUBLISHED_STATUS)}::text
+      else ${quoteLiteral(FINAL_VIEW_PENDING_STATUS)}::text
+    end as ${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)},
+    ${mergedPublicationSql} as ${quoteIdentifier(FINAL_VIEW_CURRENT_PUBLICATION_COLUMN)}
+  from ${quoteIdentifier("ranked_expected")} ranked
+  left join public.base_imoveis current_base
+    on current_base.${quoteIdentifier("codigo_crm")} = ranked.${quoteIdentifier("codigo_crm")}
 )
-select ${finalColumnSql},
-  ${quoteIdentifier(FINAL_VIEW_AD_TYPE_NAME_COLUMN)},
-  ${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)},
-  ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)},
-  row_number() over (
-    order by ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc,
-      ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
-      ${quoteIdentifier("__allocation_rule_order")} asc,
-      ${quoteIdentifier("__allocation_match_rank")} asc,
-      ${quoteIdentifier("__allocation_tier_distance")} asc
-  )::integer as ${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)}
-from final_allocation
-order by ${quoteIdentifier(FINAL_VIEW_TIER_COLUMN)} desc,
-  ${quoteIdentifier(RULE_INDEX_COLUMN)} asc,
-  ${quoteIdentifier("__allocation_rule_order")} asc,
-  ${quoteIdentifier("__allocation_match_rank")} asc,
-  ${quoteIdentifier("__allocation_tier_distance")} asc`;
+${buildPortalFinalSelect(columns)}`;
 }
 
 async function createPortalFinalIndexes(client: PoolClient, viewName: string, columns: string[]) {
@@ -2223,9 +2451,12 @@ async function createPortalFinalIndexes(client: PoolClient, viewName: string, co
   await client.query(
     `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)})`
   );
+  await client.query(
+    `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)})`
+  );
   if (hasCodigoCrm) {
     await client.query(
-      `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier("codigo_crm")})`
+      `create unique index on public.${quoteIdentifier(viewName)} (${quoteIdentifier("codigo_crm")})`
     );
     await client.query(
       `create index on public.${quoteIdentifier(viewName)} (${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)}, ${quoteIdentifier("codigo_crm")})`
@@ -2251,14 +2482,12 @@ async function refreshPortalFinalView(client: PoolClient, portalId: number) {
     });
   }
   const columns = await listPortalFinalColumns(client, candidateRules.map((rule) => rule.view_name));
-  const sql = buildPortalFinalViewSql(viewName, candidateRulesWithIndex, adTypes, columns);
+  const sql = buildPortalFinalViewSql(viewName, portal.rows[0].slug, candidateRulesWithIndex, adTypes, columns);
   await dropPortalFinalRelation(client, viewName);
   await client.query(sql);
   await createPortalFinalIndexes(client, viewName, columns);
   return { viewName, sql };
 }
-
-const HEALTHCHECK_REVERSE_SOURCE_TABLE = "imoveis_ativos";
 
 type HealthcheckRuleRow = Pick<
   PublicationRule,
@@ -2335,14 +2564,6 @@ function healthcheckAdType(rule: Pick<PublicationRule, "use_ad_limit" | "ad_limi
   };
 }
 
-function healthcheckPublishedPredicate(alias: string, portalSlug: string, adTypeSlug: string, shouldFilterType: boolean) {
-  const portalLiteral = quoteLiteral(portalSlug);
-  return [
-    `coalesce((${alias}.publicacao_portais::jsonb -> ${portalLiteral} ->> 'publicado')::boolean, false) is true`,
-    shouldFilterType ? `${alias}.publicacao_portais::jsonb -> ${portalLiteral} ->> 'tipo' = ${quoteLiteral(adTypeSlug)}` : null
-  ].filter(Boolean).join(" and ");
-}
-
 function healthcheckPendingQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
   if (!rule.portal_slug) return null;
   const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
@@ -2350,27 +2571,10 @@ function healthcheckPendingQuery(rule: HealthcheckReportRuleRow, adTypeSlug: str
   return `
 select b.codigo_crm::text as codigo_crm
 from public.${quoteIdentifier(finalViewName)} b
-where ${shouldFilterType ? `b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adTypeSlug)} and ` : ""}not (${healthcheckPublishedPredicate("b", rule.portal_slug, adTypeSlug, shouldFilterType)})
+where b.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)} = ${quoteLiteral(FINAL_VIEW_PENDING_STATUS)}
+  ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adTypeSlug)}` : ""}
 order by b.${quoteIdentifier(FINAL_VIEW_PUBLICATION_RANK_COLUMN)} asc nulls last,
   b.codigo_crm asc
-`.trim();
-}
-
-function healthcheckUnexpectedQuery(rule: HealthcheckReportRuleRow, adTypeSlug: string) {
-  if (!rule.portal_slug) return null;
-  const shouldFilterType = rule.use_ad_limit && Boolean(rule.ad_limit_type && rule.ad_limit_type !== "total");
-  const finalViewName = portalFinalViewName(rule.portal_slug);
-  return `
-select ia.codigo_crm::text as codigo_crm
-from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
-where ${healthcheckPublishedPredicate("ia", rule.portal_slug, adTypeSlug, shouldFilterType)}
-  and not exists (
-    select 1
-    from public.${quoteIdentifier(finalViewName)} p
-    where p.codigo_crm = ia.codigo_crm
-      ${shouldFilterType ? `and p.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = ${quoteLiteral(adTypeSlug)}` : ""}
-  )
-order by ia.codigo_crm
 `.trim();
 }
 
@@ -2410,21 +2614,19 @@ async function buildHealthcheckReportRule(rule: HealthcheckReportRuleRow): Promi
   };
 
   const pendingQuery = healthcheckPendingQuery(rule, adType.slug);
-  const unexpectedQuery = healthcheckUnexpectedQuery(rule, adType.slug);
   baseReport.queries.pending_codes = pendingQuery;
-  baseReport.queries.unexpected_codes = unexpectedQuery;
+  baseReport.queries.unexpected_codes = null;
 
   try {
-    const [pending, unexpected] = await Promise.all([
-      pendingQuery ? query<{ codigo_crm: string }>(pendingQuery) : Promise.resolve({ rows: [] } as { rows: Array<{ codigo_crm: string }> }),
-      unexpectedQuery ? query<{ codigo_crm: string }>(unexpectedQuery) : Promise.resolve({ rows: [] } as { rows: Array<{ codigo_crm: string }> })
-    ]);
+    const pending = pendingQuery
+      ? await query<{ codigo_crm: string }>(pendingQuery)
+      : ({ rows: [] } as { rows: Array<{ codigo_crm: string }> });
 
     return {
       ...baseReport,
       codes: {
         pending: pending.rows.map((row) => row.codigo_crm),
-        unexpected: unexpected.rows.map((row) => row.codigo_crm)
+        unexpected: []
       }
     };
   } catch (error) {
@@ -2485,7 +2687,7 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
       `
         select not exists (
           select 1
-          from (values ('publicacao_portais'), ('codigo_crm'), ($2), ($3)) as required(column_name)
+            from (values ('codigo_crm'), ($2), ($3), ($4), ($5)) as required(column_name)
           where not exists (
             select 1
             from pg_class c
@@ -2500,7 +2702,13 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
           )
         ) as ready
       `,
-      [finalViewName, FINAL_VIEW_AD_TYPE_SLUG_COLUMN, FINAL_VIEW_PUBLICATION_RANK_COLUMN]
+      [
+        finalViewName,
+        FINAL_VIEW_AD_TYPE_SLUG_COLUMN,
+        FINAL_VIEW_PUBLICATION_RANK_COLUMN,
+        FINAL_VIEW_STATUS_COLUMN,
+        FINAL_VIEW_CURRENT_PUBLICATION_COLUMN
+      ]
     );
     if (!finalViewReady.rows[0]?.ready) {
       return updateRuleHealthcheckStatus(
@@ -2511,49 +2719,7 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
         null,
         null,
         checkedAt,
-        "View final do portal sem codigo_crm, publicacao_portais, ad_type_slug ou publication_rank."
-      );
-    }
-
-    const reverseSourceReady = await client.query<{ ready: boolean }>(
-      `
-        select exists (
-          select 1
-          from pg_class c
-          join pg_namespace n on n.oid = c.relnamespace
-          where n.nspname = 'public'
-            and c.relkind in ('r', 'v', 'm')
-            and c.relname = $1
-        )
-        and not exists (
-          select 1
-          from (values ($1, 'publicacao_portais'), ($1, 'codigo_crm'), ($2, 'codigo_crm')) as required(table_name, column_name)
-          where not exists (
-            select 1
-            from pg_class c
-            join pg_namespace n on n.oid = c.relnamespace
-            join pg_attribute a on a.attrelid = c.oid
-            where n.nspname = 'public'
-              and c.relkind in ('r', 'v', 'm')
-              and c.relname = required.table_name
-              and a.attnum > 0
-              and not a.attisdropped
-              and a.attname = required.column_name
-          )
-        ) as ready
-      `,
-      [HEALTHCHECK_REVERSE_SOURCE_TABLE, finalViewName]
-    );
-    if (!reverseSourceReady.rows[0]?.ready) {
-      return updateRuleHealthcheckStatus(
-        client,
-        rule,
-        null,
-        null,
-        null,
-        null,
-        checkedAt,
-        "Base imoveis_ativos ou coluna codigo_crm/publicacao_portais indisponivel para verificacao inversa."
+        "View final do portal sem codigo_crm, ad_type_slug, publication_rank, status ou current_publication."
       );
     }
 
@@ -2563,45 +2729,41 @@ async function runSingleRuleHealthcheck(client: PoolClient, rule: HealthcheckRul
       `
         select count(*)::int as count
         from public.${quoteIdentifier(finalViewName)} b
-        ${shouldFilterType ? `where b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $1` : ""}
+        where b.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)} in ($1, $2)
+          ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $3` : ""}
       `,
-      shouldFilterType ? [adLimitTypeFilter] : []
+      shouldFilterType
+        ? [FINAL_VIEW_PUBLISHED_STATUS, FINAL_VIEW_PENDING_STATUS, adLimitTypeFilter]
+        : [FINAL_VIEW_PUBLISHED_STATUS, FINAL_VIEW_PENDING_STATUS]
     );
     const expectedCount = expected.rows[0]?.count ?? 0;
     const published = await client.query<{ count: number }>(
       `
         select count(*)::int as count
         from public.${quoteIdentifier(finalViewName)} b
-        where coalesce((b.publicacao_portais::jsonb -> $1 ->> 'publicado')::boolean, false) is true
-        ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
-        ${shouldFilterType ? "and b.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
+        where b.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)} = $1
+          ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
       `,
-      shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
+      shouldFilterType ? [FINAL_VIEW_PUBLISHED_STATUS, adLimitTypeFilter] : [FINAL_VIEW_PUBLISHED_STATUS]
     );
     const publishedCount = published.rows[0]?.count ?? 0;
-    const unexpected = await client.query<{ count: number }>(
+    const pending = await client.query<{ count: number }>(
       `
         select count(*)::int as count
-        from public.${quoteIdentifier(HEALTHCHECK_REVERSE_SOURCE_TABLE)} ia
-        where coalesce((ia.publicacao_portais::jsonb -> $1 ->> 'publicado')::boolean, false) is true
-          ${shouldFilterType ? "and ia.publicacao_portais::jsonb -> $1 ->> 'tipo' = $2" : ""}
-          and not exists (
-            select 1
-            from public.${quoteIdentifier(finalViewName)} p
-            where p.codigo_crm = ia.codigo_crm
-              ${shouldFilterType ? `and p.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
-          )
+        from public.${quoteIdentifier(finalViewName)} b
+        where b.${quoteIdentifier(FINAL_VIEW_STATUS_COLUMN)} = $1
+          ${shouldFilterType ? `and b.${quoteIdentifier(FINAL_VIEW_AD_TYPE_SLUG_COLUMN)} = $2` : ""}
       `,
-      shouldFilterType ? [rule.portal_slug, adLimitTypeFilter] : [rule.portal_slug]
+      shouldFilterType ? [FINAL_VIEW_PENDING_STATUS, adLimitTypeFilter] : [FINAL_VIEW_PENDING_STATUS]
     );
-    const unexpectedCount = unexpected.rows[0]?.count ?? 0;
+    const pendingCount = pending.rows[0]?.count ?? 0;
     return updateRuleHealthcheckStatus(
       client,
       rule,
       expectedCount,
       publishedCount,
-      Math.max(expectedCount - publishedCount, 0),
-      unexpectedCount,
+      pendingCount,
+      0,
       checkedAt,
       null
     );

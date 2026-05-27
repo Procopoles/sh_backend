@@ -471,7 +471,6 @@ function previewColumnsForFilters(filters: RuleFilters, columns: ColumnMetadata[
 function previewIdentifierColumn(columns: ColumnMetadata[]) {
   return (
     columns.find((column) => column.column_name === "codigo_crm" && !sanitizeJsonPath(column.json_path).length) ??
-    columns.find((column) => column.column_name === "codigo_crm" && !sanitizeJsonPath(column.json_path).length) ??
     columns.find((column) => column.column_name === "id_interno" && !sanitizeJsonPath(column.json_path).length) ??
     columns.find((column) => !sanitizeJsonPath(column.json_path).length)
   );

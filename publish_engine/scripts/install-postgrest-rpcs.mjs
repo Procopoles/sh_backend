@@ -77,6 +77,25 @@ as $$
   )
 $$;
 
+create or replace function public.publish_publication_type_slug(publication_data jsonb, portal_slug text)
+returns text
+language sql
+immutable
+as $$
+  with raw_value as (
+    select coalesce(
+      nullif(btrim(publication_data -> portal_slug ->> 'tipo_slug'), ''),
+      nullif(btrim(publication_data -> portal_slug ->> 'tipo'), ''),
+      nullif(btrim(publication_data -> portal_slug ->> 'tipo_crm'), '')
+    ) as value
+  )
+  select case
+    when value is null then null
+    else public.publish_slugify(value)
+  end
+  from raw_value
+$$;
+
 create table if not exists public.publish_portal_ad_types (
   id serial primary key,
   portal_id integer not null references public.publish_portals(id) on delete cascade,
@@ -221,7 +240,6 @@ returns trigger
 language plpgsql
 as $$
 begin
-  new.name := lower(regexp_replace(btrim(new.name), '[[:space:]]+', ' ', 'g'));
   new.slug := public.publish_slugify(new.name);
   return new;
 end
@@ -237,6 +255,225 @@ execute function public.normalize_publish_portal_ad_type_name();
 
 grant all privileges on public.publish_portal_ad_types to service_role;
 grant all privileges on sequence public.publish_portal_ad_types_id_seq to service_role;
+
+create table if not exists public.publish_automations (
+  key text primary key,
+  name text not null,
+  description text,
+  database_name text not null default current_database(),
+  schema_name text not null default 'public',
+  table_name text not null,
+  target_column text not null,
+  run_mode text not null,
+  active boolean not null default true,
+  sql_text text not null,
+  trigger_name text,
+  function_name text,
+  last_run_at timestamptz,
+  last_affected_count integer,
+  deleted_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table if exists public.publish_automations
+add column if not exists description text,
+add column if not exists database_name text not null default current_database(),
+add column if not exists schema_name text not null default 'public',
+add column if not exists table_name text not null default 'base_imoveis',
+add column if not exists target_column text not null default 'publicacao_portais',
+add column if not exists run_mode text not null default 'trigger_db',
+add column if not exists active boolean not null default true,
+add column if not exists sql_text text,
+add column if not exists trigger_name text,
+add column if not exists function_name text,
+add column if not exists last_run_at timestamptz,
+add column if not exists last_affected_count integer,
+add column if not exists deleted_at timestamptz,
+add column if not exists created_at timestamptz not null default now(),
+add column if not exists updated_at timestamptz not null default now();
+
+create index if not exists publish_automations_deleted_at_idx
+on public.publish_automations(deleted_at);
+
+insert into public.publish_automations
+  (key, name, description, database_name, schema_name, table_name, target_column, run_mode, active, sql_text, trigger_name, function_name)
+values (
+  'grupo_zap_tipo_padrao',
+  'Grupo Zap - tipo padrao',
+  'Define automaticamente tipo_crm e tipo_slug padrao para publicacoes Grupo Zap sem tipo CRM.',
+  current_database(),
+  'public',
+  'base_imoveis',
+  'publicacao_portais',
+  'trigger_db',
+  true,
+  'update public.base_imoveis
+set publicacao_portais = jsonb_set(
+  jsonb_set(coalesce(publicacao_portais, ''{}''::jsonb), ''{grupo_zap,tipo_crm}'', to_jsonb(''padrão''::text), true),
+  ''{grupo_zap,tipo_slug}'', to_jsonb(''padrao''::text), true
+)
+where publicacao_portais -> ''grupo_zap'' ->> ''publicado'' = ''true''
+  and publicacao_portais -> ''grupo_zap'' ->> ''tipo_crm'' is null;',
+  'publish_automation_grupo_zap_tipo_padrao_biu',
+  'publish_automation_grupo_zap_tipo_padrao'
+)
+on conflict (key) do update
+set name = excluded.name,
+    description = excluded.description,
+    database_name = current_database(),
+    schema_name = excluded.schema_name,
+    table_name = excluded.table_name,
+    target_column = excluded.target_column,
+    run_mode = excluded.run_mode,
+    sql_text = excluded.sql_text,
+    trigger_name = excluded.trigger_name,
+    function_name = excluded.function_name,
+    updated_at = now();
+
+create or replace function public.publish_automation_grupo_zap_tipo_padrao()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_catalog
+as $$
+declare
+  automation_enabled boolean;
+begin
+  select exists (
+    select 1
+    from public.publish_automations
+    where key = 'grupo_zap_tipo_padrao'
+      and active = true
+      and deleted_at is null
+  )
+  into automation_enabled;
+
+  if not automation_enabled then
+    return new;
+  end if;
+
+  if new.publicacao_portais -> 'grupo_zap' ->> 'publicado' = 'true'
+    and new.publicacao_portais -> 'grupo_zap' ->> 'tipo_crm' is null
+  then
+    new.publicacao_portais := jsonb_set(
+      jsonb_set(coalesce(new.publicacao_portais, '{}'::jsonb), '{grupo_zap,tipo_crm}', to_jsonb('padrão'::text), true),
+      '{grupo_zap,tipo_slug}',
+      to_jsonb('padrao'::text),
+      true
+    );
+  end if;
+
+  return new;
+end
+$$;
+
+create or replace function public.publish_apply_automation(target_key text)
+returns table (
+  automation_key text,
+  affected_count integer,
+  ran_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public, pg_catalog
+as $$
+declare
+  should_run boolean;
+begin
+  if target_key <> 'grupo_zap_tipo_padrao' then
+    raise exception 'Automacao % nao encontrada.', target_key using errcode = 'P0002';
+  end if;
+
+  select active = true and deleted_at is null
+  into should_run
+  from public.publish_automations
+  where key = target_key;
+
+  if should_run is null then
+    raise exception 'Automacao % nao encontrada.', target_key using errcode = 'P0002';
+  end if;
+
+  automation_key := target_key;
+  affected_count := 0;
+  ran_at := now();
+
+  if not should_run then
+    return next;
+    return;
+  end if;
+
+  if not exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'base_imoveis'
+      and column_name = 'publicacao_portais'
+  ) then
+    raise exception 'public.base_imoveis.publicacao_portais indisponivel.' using errcode = 'P0002';
+  end if;
+
+  update public.base_imoveis
+  set publicacao_portais = jsonb_set(
+    jsonb_set(coalesce(publicacao_portais, '{}'::jsonb), '{grupo_zap,tipo_crm}', to_jsonb('padrão'::text), true),
+    '{grupo_zap,tipo_slug}',
+    to_jsonb('padrao'::text),
+    true
+  )
+  where publicacao_portais -> 'grupo_zap' ->> 'publicado' = 'true'
+    and publicacao_portais -> 'grupo_zap' ->> 'tipo_crm' is null;
+
+  get diagnostics affected_count = row_count;
+
+  update public.publish_automations
+  set last_run_at = ran_at,
+      last_affected_count = affected_count,
+      updated_at = now()
+  where key = target_key;
+
+  return next;
+end
+$$;
+
+do $$
+begin
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'base_imoveis'
+      and column_name = 'publicacao_portais'
+  ) then
+    drop trigger if exists publish_automation_grupo_zap_tipo_padrao_biu on public.base_imoveis;
+
+    create trigger publish_automation_grupo_zap_tipo_padrao_biu
+    before insert or update of publicacao_portais
+    on public.base_imoveis
+    for each row
+    execute function public.publish_automation_grupo_zap_tipo_padrao();
+  end if;
+end
+$$;
+
+do $$
+begin
+  if exists (
+    select 1
+    from public.publish_automations
+    where key = 'grupo_zap_tipo_padrao'
+      and active = true
+      and deleted_at is null
+      and last_run_at is null
+  ) then
+    perform *
+    from public.publish_apply_automation('grupo_zap_tipo_padrao');
+  end if;
+end
+$$;
+
+grant all privileges on public.publish_automations to service_role;
+grant execute on function public.publish_automation_grupo_zap_tipo_padrao() to service_role;
+grant execute on function public.publish_apply_automation(text) to service_role;
 
 create or replace function public.publish_ad_limit_quota(target_portal_id integer, target_ad_limit_type text default 'total')
 returns integer
@@ -1508,9 +1745,9 @@ declare
   rule_row record;
   final_view_name text;
   final_view_ready boolean;
-  reverse_source_ready boolean;
   should_filter_type boolean;
   ad_limit_type_slug text;
+  refreshed_portal_ids integer[] := array[]::integer[];
 begin
   for rule_row in
     select r.id, r.portal_id, r.view_name, r.use_ad_limit, r.ad_limit_type, p.slug as portal_slug
@@ -1533,6 +1770,12 @@ begin
       if rule_row.portal_id is null or rule_row.portal_slug is null or rule_row.portal_slug = '' then
         error := 'Regra sem portal vinculado.';
       else
+        if rule_row.portal_id <> all(refreshed_portal_ids) then
+          perform *
+          from public.refresh_publish_portal_final_view(rule_row.portal_id);
+          refreshed_portal_ids := array_append(refreshed_portal_ids, rule_row.portal_id);
+        end if;
+
         final_view_name := 'pc_' || rule_row.portal_slug || '_final';
         if final_view_name !~ '^pc_[a-z0-9_]+_final$' or length(final_view_name) > 63 then
           error := 'Nome de view final invalido.';
@@ -1548,7 +1791,7 @@ begin
         else
           select not exists (
             select 1
-            from (values ('publicacao_portais'), ('codigo_crm'), ('ad_type_slug'), ('publication_rank')) as required(column_name)
+            from (values ('codigo_crm'), ('ad_type_slug'), ('publication_rank'), ('status'), ('current_publication')) as required(column_name)
             where not exists (
               select 1
               from pg_class c
@@ -1564,35 +1807,7 @@ begin
           ) into final_view_ready;
 
           if not final_view_ready then
-            error := 'View final do portal sem codigo_crm, publicacao_portais, ad_type_slug ou publication_rank.';
-          else
-          select exists (
-            select 1
-            from pg_class c
-            join pg_namespace n on n.oid = c.relnamespace
-            where n.nspname = 'public'
-              and c.relkind in ('r', 'v', 'm')
-              and c.relname = 'imoveis_ativos'
-          )
-          and not exists (
-            select 1
-            from (values ('imoveis_ativos', 'publicacao_portais'), ('imoveis_ativos', 'codigo_crm'), (final_view_name, 'codigo_crm')) as required(table_name, column_name)
-            where not exists (
-              select 1
-              from pg_class c
-              join pg_namespace n on n.oid = c.relnamespace
-              join pg_attribute a on a.attrelid = c.oid
-              where n.nspname = 'public'
-                and c.relkind in ('r', 'v', 'm')
-                and c.relname = required.table_name
-                and a.attnum > 0
-                and not a.attisdropped
-                and a.attname = required.column_name
-            )
-          ) into reverse_source_ready;
-
-          if not reverse_source_ready then
-            error := 'Base imoveis_ativos ou coluna codigo_crm/publicacao_portais indisponivel para verificacao inversa.';
+            error := 'View final do portal sem codigo_crm, ad_type_slug, publication_rank, status ou current_publication.';
           else
             should_filter_type := rule_row.use_ad_limit
               and coalesce(rule_row.ad_limit_type, '') <> ''
@@ -1601,53 +1816,44 @@ begin
 
             if should_filter_type then
               execute format(
-                'select count(*)::int from public.%I b where b.ad_type_slug = %L',
+                'select count(*)::int from public.%I b where b.ad_type_slug = %L and b.status in (''published'', ''pending'')',
                 final_view_name,
                 ad_limit_type_slug
               ) into expected_count;
             else
-              execute format('select count(*)::int from public.%I', final_view_name)
+              execute format('select count(*)::int from public.%I b where b.status in (''published'', ''pending'')', final_view_name)
               into expected_count;
             end if;
 
             if should_filter_type then
               execute format(
-                'select count(*)::int from public.%I b where b.ad_type_slug = %L and coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and b.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L',
+                'select count(*)::int from public.%I b where b.ad_type_slug = %L and b.status = ''published''',
                 final_view_name,
-                ad_limit_type_slug,
-                rule_row.portal_slug,
-                rule_row.portal_slug,
                 ad_limit_type_slug
               ) into published_count;
             else
               execute format(
-                'select count(*)::int from public.%I b where coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true',
-                final_view_name,
-                rule_row.portal_slug
+                'select count(*)::int from public.%I b where b.status = ''published''',
+                final_view_name
               ) into published_count;
             end if;
 
             if should_filter_type then
               execute format(
-                'select count(*)::int from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and ia.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm and p.ad_type_slug = %L)',
-                rule_row.portal_slug,
-                rule_row.portal_slug,
-                ad_limit_type_slug,
+                'select count(*)::int from public.%I b where b.ad_type_slug = %L and b.status = ''pending''',
                 final_view_name,
                 ad_limit_type_slug
-              ) into unexpected_count;
+              ) into pending_count;
             else
               execute format(
-                'select count(*)::int from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm)',
-                rule_row.portal_slug,
+                'select count(*)::int from public.%I b where b.status = ''pending''',
                 final_view_name
-              ) into unexpected_count;
+              ) into pending_count;
             end if;
 
-            pending_count := greatest(coalesce(expected_count, 0) - coalesce(published_count, 0), 0);
+            unexpected_count := 0;
           end if;
         end if;
-      end if;
       end if;
     exception when others then
       expected_count := null;
@@ -1707,7 +1913,6 @@ declare
   ad_limit_type_name text;
   ad_limit_type_slug text;
   pending_query text;
-  unexpected_query text;
   pending_codes jsonb;
   unexpected_codes jsonb;
   rules_json jsonb := '[]'::jsonb;
@@ -1740,7 +1945,6 @@ begin
     pending_codes := '[]'::jsonb;
     unexpected_codes := '[]'::jsonb;
     pending_query := null;
-    unexpected_query := null;
     rule_error := rule_row.health_error;
     ad_limit_type_name := case
       when rule_row.use_ad_limit and coalesce(rule_row.ad_limit_type, '') <> '' then rule_row.ad_limit_type
@@ -1761,43 +1965,19 @@ begin
       else
         pending_query := case when should_filter_type then
           format(
-            'select b.codigo_crm::text as codigo_crm, b.publication_rank::integer as publication_rank from public.%I b where b.ad_type_slug = %L and not (coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and b.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L) order by b.publication_rank asc nulls last, b.codigo_crm asc',
-            final_view_name,
-            ad_limit_type_slug,
-            rule_row.portal_slug,
-            rule_row.portal_slug,
-            ad_limit_type_slug
-          )
-        else
-          format(
-            'select b.codigo_crm::text as codigo_crm, b.publication_rank::integer as publication_rank from public.%I b where not (coalesce((b.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true) order by b.publication_rank asc nulls last, b.codigo_crm asc',
-            final_view_name,
-            rule_row.portal_slug
-          )
-        end;
-
-        unexpected_query := case when should_filter_type then
-          format(
-            'select ia.codigo_crm::text as codigo_crm from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and ia.publicacao_portais::jsonb -> %L ->> ''tipo'' = %L and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm and p.ad_type_slug = %L) order by ia.codigo_crm',
-            rule_row.portal_slug,
-            rule_row.portal_slug,
-            ad_limit_type_slug,
+            'select b.codigo_crm::text as codigo_crm, b.publication_rank::integer as publication_rank from public.%I b where b.status = ''pending'' and b.ad_type_slug = %L order by b.publication_rank asc nulls last, b.codigo_crm asc',
             final_view_name,
             ad_limit_type_slug
           )
         else
           format(
-            'select ia.codigo_crm::text as codigo_crm from public.imoveis_ativos ia where coalesce((ia.publicacao_portais::jsonb -> %L ->> ''publicado'')::boolean, false) is true and not exists (select 1 from public.%I p where p.codigo_crm = ia.codigo_crm) order by ia.codigo_crm',
-            rule_row.portal_slug,
+            'select b.codigo_crm::text as codigo_crm, b.publication_rank::integer as publication_rank from public.%I b where b.status = ''pending'' order by b.publication_rank asc nulls last, b.codigo_crm asc',
             final_view_name
           )
         end;
 
         execute format('select coalesce(jsonb_agg(codigo_crm order by publication_rank asc nulls last, codigo_crm asc), ''[]''::jsonb) from (%s) codes', pending_query)
         into pending_codes;
-
-        execute format('select coalesce(jsonb_agg(codigo_crm order by codigo_crm), ''[]''::jsonb) from (%s) codes', unexpected_query)
-        into unexpected_codes;
       end if;
     exception when others then
       pending_codes := '[]'::jsonb;
@@ -1838,7 +2018,7 @@ begin
         ),
         'queries', jsonb_build_object(
           'pending_codes', pending_query,
-          'unexpected_codes', unexpected_query
+          'unexpected_codes', null
         ),
         'error', rule_error
       )
@@ -1932,7 +2112,7 @@ begin
     and c.relname = source_name
     and a.attnum > 0
     and not a.attisdropped
-    and a.attname not in ('__publish_rule_index', '__allocation_rule_order', '__ad_type_duplicate_rank', 'ad_type_name', 'ad_type_slug', 'tier', 'publication_rank');
+    and a.attname not in ('__publish_rule_index', '__allocation_rule_order', '__ad_type_duplicate_rank', '__allocation_match_rank', '__allocation_tier_distance', '__candidate_ad_type_slug', '__candidate_tier', 'ad_type_name', 'ad_type_slug', 'tier', 'publication_rank', 'status', 'current_publication');
 
   if source_columns_sql is null or source_columns_sql = '' then
     raise exception 'Nenhuma coluna publicavel encontrada em %', source_name using errcode = '22023';
@@ -2020,9 +2200,11 @@ declare
   ad_type_row record;
   target_view text;
   final_column_names text[] := array['codigo_crm', 'publicacao_portais'];
+  output_column_names text[] := array['codigo_crm'];
   candidate_columns_sql text;
   eligible_columns_sql text;
   final_columns_sql text;
+  combined_columns_sql text;
   view_sql text;
   candidate_parts text[] := array[]::text[];
   allocated_parts text[] := array[]::text[];
@@ -2036,6 +2218,8 @@ declare
   allocation_index integer := 0;
   cte_name text;
   ad_type_values_sql text;
+  ad_type_source_sql text;
+  combined_select_sql text;
   missing_columns text[];
 begin
   select *
@@ -2060,9 +2244,13 @@ begin
   into eligible_columns_sql
   from unnest(final_column_names) as column_item(column_name);
 
-  select string_agg(format('%I', column_item.column_name), ', ')
+  select string_agg(format('ranked.%I', column_item.column_name), ', ')
   into final_columns_sql
   from unnest(final_column_names) as column_item(column_name);
+
+  select string_agg(format('expected.%I', column_item.column_name), ', ')
+  into combined_columns_sql
+  from unnest(output_column_names) as column_item(column_name);
 
   select string_agg(
     format(
@@ -2078,6 +2266,36 @@ begin
   into ad_type_values_sql
   from public.publish_portal_ad_types a
   where a.portal_id = target_portal_id;
+
+  ad_type_source_sql := case
+    when ad_type_values_sql is null then 'select null::text as ad_type_name, null::text as ad_type_slug, null::integer as tier, null::integer as quantity where false'
+    else 'values ' || ad_type_values_sql
+  end;
+
+  select array_agg(required.column_name order by required.ordinality)
+  into missing_columns
+  from unnest(final_column_names) with ordinality as required(column_name, ordinality)
+  where not exists (
+    select 1
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    join pg_attribute attr on attr.attrelid = c.oid
+    where n.nspname = 'public'
+      and c.relkind in ('r', 'v', 'm')
+      and c.relname = 'base_imoveis'
+      and attr.attnum > 0
+      and not attr.attisdropped
+      and attr.attname = required.column_name
+  );
+
+  if missing_columns is not null then
+    raise exception 'base_imoveis precisa expor % para consolidacao final.', array_to_string(missing_columns, ', ') using errcode = '22023';
+  end if;
+
+  combined_select_sql := format(
+    'select %s, expected.ad_type_name, expected.ad_type_slug, expected.tier, expected.publication_rank, expected.status, expected.current_publication from expected_publications expected order by case expected.status when ''pending'' then 0 when ''published'' then 2 else 2 end, expected.publication_rank asc nulls last, expected.tier desc nulls last, expected.codigo_crm asc',
+    combined_columns_sql
+  );
 
   for rule_row in
     select r.id as rule_id,
@@ -2184,9 +2402,11 @@ begin
     end if;
 
     view_sql := format(
-      'create materialized view public.%I as select %s, null::text as ad_type_name, null::text as ad_type_slug, null::integer as tier, null::integer as publication_rank from public.base_imoveis b where false',
+      'create materialized view public.%I as with ad_types(ad_type_name, ad_type_slug, tier, quantity) as (%s), expected_publications as (select %s, null::text as ad_type_name, null::text as ad_type_slug, null::integer as tier, null::integer as publication_rank, ''published''::text as status, b.publicacao_portais::jsonb as current_publication from public.base_imoveis b where false) %s',
       target_view,
-      candidate_columns_sql
+      ad_type_source_sql,
+      candidate_columns_sql,
+      combined_select_sql
     );
   else
     for ad_type_row in
@@ -2206,7 +2426,7 @@ begin
       end loop;
 
       allocated_parts := array_append(allocated_parts, format(
-        '%I as (select * from deduped d where d.ad_type_slug = %L%s order by d.__publish_rule_index asc, d.__allocation_rule_order asc limit %s)',
+        '%I as (select * from deduped d where d.ad_type_slug = %L%s order by d.__publish_rule_index asc, d.__allocation_rule_order asc, d.codigo_crm asc limit %s)',
         cte_name,
         ad_type_row.ad_type_slug,
         exclusion_sql,
@@ -2221,14 +2441,17 @@ begin
     from unnest(allocated_names) as allocated(allocated_name);
 
     view_sql := format(
-      'create materialized view public.%I as with ad_types(ad_type_name, ad_type_slug, tier, quantity) as (values %s), candidates as (%s), eligible as (select c.__allocation_rule_order, a.ad_type_name, a.ad_type_slug, a.tier, case when c.__candidate_ad_type_slug = a.ad_type_slug then 0 when c.__candidate_ad_type_slug is null then 2 else 1 end::integer as __allocation_match_rank, abs(coalesce(c.__candidate_tier, a.tier) - a.tier)::integer as __allocation_tier_distance, c.__candidate_tier, c.__publish_rule_index, %s from candidates c join ad_types a on c.__candidate_ad_type_slug = a.ad_type_slug), deduped as (select * from (select eligible.*, row_number() over (partition by codigo_crm, ad_type_slug order by __publish_rule_index asc, __allocation_rule_order asc) as __ad_type_duplicate_rank from eligible) ranked where __ad_type_duplicate_rank = 1), %s, final_allocation as (%s) select %s, ad_type_name, ad_type_slug, tier, row_number() over (order by tier desc, __publish_rule_index asc, __allocation_rule_order asc, __allocation_match_rank asc, __allocation_tier_distance asc)::integer as publication_rank from final_allocation order by tier desc, __publish_rule_index asc, __allocation_rule_order asc, __allocation_match_rank asc, __allocation_tier_distance asc',
+      'create materialized view public.%I as with ad_types(ad_type_name, ad_type_slug, tier, quantity) as (%s), candidates as (%s), eligible as (select c.__allocation_rule_order, a.ad_type_name, a.ad_type_slug, a.tier, case when c.__candidate_ad_type_slug = a.ad_type_slug then 0 when c.__candidate_ad_type_slug is null then 2 else 1 end::integer as __allocation_match_rank, abs(coalesce(c.__candidate_tier, a.tier) - a.tier)::integer as __allocation_tier_distance, c.__candidate_tier, c.__publish_rule_index, %s from candidates c join ad_types a on c.__candidate_ad_type_slug = a.ad_type_slug), deduped as (select * from (select eligible.*, row_number() over (partition by codigo_crm, ad_type_slug order by __publish_rule_index asc, __allocation_rule_order asc) as __ad_type_duplicate_rank from eligible) ranked where __ad_type_duplicate_rank = 1), %s, final_allocation as (%s), ranked_expected as (select final_allocation.*, row_number() over (order by tier desc, __publish_rule_index asc, __allocation_rule_order asc, __allocation_match_rank asc, __allocation_tier_distance asc, codigo_crm asc)::integer as publication_rank from final_allocation), expected_publications as (select %s, ranked.ad_type_name, ranked.ad_type_slug, ranked.tier, ranked.publication_rank, case when coalesce((coalesce(current_base.publicacao_portais::jsonb, ranked.publicacao_portais::jsonb) -> %L ->> ''publicado'')::boolean, false) is true and public.publish_publication_type_slug(coalesce(current_base.publicacao_portais::jsonb, ranked.publicacao_portais::jsonb), %L) = ranked.ad_type_slug then ''published''::text else ''pending''::text end as status, coalesce(current_base.publicacao_portais::jsonb, ranked.publicacao_portais::jsonb) as current_publication from ranked_expected ranked left join public.base_imoveis current_base on current_base.codigo_crm = ranked.codigo_crm) %s',
       target_view,
-      ad_type_values_sql,
+      ad_type_source_sql,
       array_to_string(candidate_parts, E'\\nunion all\\n'),
       eligible_columns_sql,
       array_to_string(allocated_parts, E',\\n'),
       final_union_sql,
-      final_columns_sql
+      final_columns_sql,
+      portal_row.slug,
+      portal_row.slug,
+      combined_select_sql
     );
   end if;
 
@@ -2250,8 +2473,9 @@ begin
   execute view_sql;
   execute format('create index on public.%I (ad_type_slug)', target_view);
   execute format('create index on public.%I (publication_rank)', target_view);
+  execute format('create index on public.%I (status)', target_view);
   if final_column_names is not null and 'codigo_crm' = any(final_column_names) then
-    execute format('create index on public.%I (codigo_crm)', target_view);
+    execute format('create unique index on public.%I (codigo_crm)', target_view);
     execute format('create index on public.%I (ad_type_slug, codigo_crm)', target_view);
   end if;
   execute format('grant select on public.%I to service_role', target_view);
@@ -2376,6 +2600,7 @@ as $$
 $$;
 
 grant execute on function public.publish_filter_kind(text) to service_role;
+grant execute on function public.publish_publication_type_slug(jsonb, text) to service_role;
 grant execute on function public.publish_base_columns() to service_role;
 grant execute on function public.publish_control_counts() to service_role;
 grant execute on function public.publish_source_views() to service_role;

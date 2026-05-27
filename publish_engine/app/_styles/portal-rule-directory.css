@@ -2,6 +2,7 @@
 
 .portal-directory,
 .rule-directory,
+.automation-directory,
 .status-directory,
 .portal-form,
 .portal-rules-section {
@@ -18,6 +19,7 @@
 
 .portal-directory,
 .rule-directory,
+.automation-directory,
 .status-directory,
 .portal-form,
 .portal-rules-section {
@@ -38,13 +40,15 @@
 }
 
 .portal-table,
-.rule-table {
+.rule-table,
+.automation-table {
   display: grid;
   overflow-x: auto;
 }
 
 .portal-row,
-.rule-row {
+.rule-row,
+.automation-row {
   align-items: center;
   background: var(--surface);
   border: 0;
@@ -72,26 +76,36 @@
   min-width: 866px;
 }
 
+.automation-row {
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.9fr) minmax(76px, 0.35fr) minmax(118px, 0.55fr) max-content;
+  min-width: 0;
+}
+
 .portal-row:hover:not(.header),
 .portal-row.selected,
 .rule-row:hover:not(.header),
-.rule-row.selected {
+.rule-row.selected,
+.automation-row:hover:not(.header),
+.automation-row.selected {
   background: #202631;
 }
 
 .portal-row:hover:not(.header),
-.rule-row:hover:not(.header) {
+.rule-row:hover:not(.header),
+.automation-row:hover:not(.header) {
   box-shadow: inset 3px 0 0 rgba(34, 211, 238, 0.42), 0 12px 28px rgba(0, 0, 0, 0.22);
   transform: translateX(2px);
 }
 
 .portal-row.selected,
-.rule-row.selected {
+.rule-row.selected,
+.automation-row.selected {
   box-shadow: inset 3px 0 0 var(--blue);
 }
 
 .portal-row.header,
-.rule-row.header {
+.rule-row.header,
+.automation-row.header {
   background: var(--surface-muted);
   color: var(--muted);
   font-size: 12px;
@@ -215,6 +229,31 @@
   background: rgba(255, 255, 255, 0.055);
   border-color: var(--line);
   color: var(--muted);
+}
+
+.automation-node-icon {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.28);
+  color: #fcd34d;
+}
+
+.automation-row > span:not(.portal-cell):not(.status-pill),
+.automation-row .portal-cell,
+.automation-row .portal-cell > span:last-child,
+.automation-row .portal-cell strong {
+  min-width: 0;
+}
+
+.automation-row > span:not(.portal-cell):not(.status-pill),
+.automation-row .portal-cell strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-row .status-pill {
+  justify-self: start;
+  white-space: nowrap;
 }
 
 .rule-title-copy {

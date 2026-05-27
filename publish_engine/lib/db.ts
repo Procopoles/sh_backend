@@ -8,6 +8,16 @@ declare global {
 }
 
 const SCHEMA_LOCK_NAME = "publish_control_schema";
+const DEFAULT_AUTOMATION_KEY = "grupo_zap_tipo_padrao";
+const DEFAULT_AUTOMATION_FUNCTION = "publish_automation_grupo_zap_tipo_padrao";
+const DEFAULT_AUTOMATION_TRIGGER = "publish_automation_grupo_zap_tipo_padrao_biu";
+const DEFAULT_AUTOMATION_SQL = `update public.base_imoveis
+set publicacao_portais = jsonb_set(
+  jsonb_set(coalesce(publicacao_portais, '{}'::jsonb), '{grupo_zap,tipo_crm}', to_jsonb('padrão'::text), true),
+  '{grupo_zap,tipo_slug}', to_jsonb('padrao'::text), true
+)
+where publicacao_portais -> 'grupo_zap' ->> 'publicado' = 'true'
+  and publicacao_portais -> 'grupo_zap' ->> 'tipo_crm' is null;`;
 
 function getConnectionString() {
   const connectionString = process.env.DATABASE_URL;
@@ -160,6 +170,27 @@ async function runControlSchemaMigration(client: PoolClient) {
   `);
 
   await client.query(`
+    create or replace function public.publish_publication_type_slug(publication_data jsonb, portal_slug text)
+    returns text
+    language sql
+    immutable
+    as $$
+      with raw_value as (
+        select coalesce(
+          nullif(btrim(publication_data -> portal_slug ->> 'tipo_slug'), ''),
+          nullif(btrim(publication_data -> portal_slug ->> 'tipo'), ''),
+          nullif(btrim(publication_data -> portal_slug ->> 'tipo_crm'), '')
+        ) as value
+      )
+      select case
+        when value is null then null
+        else public.publish_slugify(value)
+      end
+      from raw_value
+    $$;
+  `);
+
+  await client.query(`
     alter table if exists publish_portal_ad_types
     add column if not exists slug text;
 
@@ -297,9 +328,9 @@ async function runControlSchemaMigration(client: PoolClient) {
     create or replace function normalize_publish_portal_ad_type_name()
     returns trigger
     language plpgsql
+    set search_path = public, pg_catalog
     as $$
     begin
-      new.name := lower(regexp_replace(btrim(new.name), '[[:space:]]+', ' ', 'g'));
       new.slug := public.publish_slugify(new.name);
       return new;
     end
@@ -465,6 +496,229 @@ async function runControlSchemaMigration(client: PoolClient) {
           and conname = 'publish_rules_portal_id_slug_key'
       ) then
         alter table publish_rules drop constraint publish_rules_portal_id_slug_key;
+      end if;
+    end
+    $$;
+  `);
+
+  await installAutomationSchema(client);
+}
+
+async function installAutomationSchema(client: PoolClient) {
+  await client.query(`
+    create table if not exists publish_automations (
+      key text primary key,
+      name text not null,
+      description text,
+      database_name text not null default current_database(),
+      schema_name text not null default 'public',
+      table_name text not null,
+      target_column text not null,
+      run_mode text not null,
+      active boolean not null default true,
+      sql_text text not null,
+      trigger_name text,
+      function_name text,
+      last_run_at timestamptz,
+      last_affected_count integer,
+      deleted_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await client.query(`
+    alter table if exists publish_automations
+    add column if not exists description text,
+    add column if not exists database_name text not null default current_database(),
+    add column if not exists schema_name text not null default 'public',
+    add column if not exists table_name text not null default 'base_imoveis',
+    add column if not exists target_column text not null default 'publicacao_portais',
+    add column if not exists run_mode text not null default 'trigger_db',
+    add column if not exists active boolean not null default true,
+    add column if not exists sql_text text,
+    add column if not exists trigger_name text,
+    add column if not exists function_name text,
+    add column if not exists last_run_at timestamptz,
+    add column if not exists last_affected_count integer,
+    add column if not exists deleted_at timestamptz,
+    add column if not exists created_at timestamptz not null default now(),
+    add column if not exists updated_at timestamptz not null default now();
+
+    create index if not exists publish_automations_deleted_at_idx
+    on publish_automations(deleted_at);
+  `);
+
+  await client.query(
+    `
+      insert into publish_automations
+        (key, name, description, database_name, schema_name, table_name, target_column, run_mode, active, sql_text, trigger_name, function_name)
+      values
+        ($1, $2, $3, current_database(), 'public', 'base_imoveis', 'publicacao_portais', 'trigger_db', true, $4, $5, $6)
+      on conflict (key) do update
+      set name = excluded.name,
+          description = excluded.description,
+          database_name = current_database(),
+          schema_name = excluded.schema_name,
+          table_name = excluded.table_name,
+          target_column = excluded.target_column,
+          run_mode = excluded.run_mode,
+          sql_text = excluded.sql_text,
+          trigger_name = excluded.trigger_name,
+          function_name = excluded.function_name,
+          updated_at = now()
+    `,
+    [
+      DEFAULT_AUTOMATION_KEY,
+      "Grupo Zap - tipo padrao",
+      "Define automaticamente tipo_crm e tipo_slug padrao para publicacoes Grupo Zap sem tipo CRM.",
+      DEFAULT_AUTOMATION_SQL,
+      DEFAULT_AUTOMATION_TRIGGER,
+      DEFAULT_AUTOMATION_FUNCTION
+    ]
+  );
+
+  await client.query(`
+    create or replace function public.${DEFAULT_AUTOMATION_FUNCTION}()
+    returns trigger
+    language plpgsql
+    set search_path = public, pg_catalog
+    as $$
+    declare
+      automation_enabled boolean;
+    begin
+      select exists (
+        select 1
+        from public.publish_automations
+        where key = '${DEFAULT_AUTOMATION_KEY}'
+          and active = true
+          and deleted_at is null
+      )
+      into automation_enabled;
+
+      if not automation_enabled then
+        return new;
+      end if;
+
+      if new.publicacao_portais -> 'grupo_zap' ->> 'publicado' = 'true'
+        and new.publicacao_portais -> 'grupo_zap' ->> 'tipo_crm' is null
+      then
+        new.publicacao_portais := jsonb_set(
+          jsonb_set(coalesce(new.publicacao_portais, '{}'::jsonb), '{grupo_zap,tipo_crm}', to_jsonb('padrão'::text), true),
+          '{grupo_zap,tipo_slug}',
+          to_jsonb('padrao'::text),
+          true
+        );
+      end if;
+
+      return new;
+    end
+    $$;
+  `);
+
+  await client.query(`
+    create or replace function public.publish_apply_automation(target_key text)
+    returns table (
+      automation_key text,
+      affected_count integer,
+      ran_at timestamptz
+    )
+    language plpgsql
+    set search_path = public, pg_catalog
+    as $$
+    declare
+      should_run boolean;
+    begin
+      if target_key <> '${DEFAULT_AUTOMATION_KEY}' then
+        raise exception 'Automacao % nao encontrada.', target_key using errcode = 'P0002';
+      end if;
+
+      select active = true and deleted_at is null
+      into should_run
+      from public.publish_automations
+      where key = target_key;
+
+      if should_run is null then
+        raise exception 'Automacao % nao encontrada.', target_key using errcode = 'P0002';
+      end if;
+
+      automation_key := target_key;
+      affected_count := 0;
+      ran_at := now();
+
+      if not should_run then
+        return next;
+        return;
+      end if;
+
+      if not exists (
+        select 1
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'base_imoveis'
+          and column_name = 'publicacao_portais'
+      ) then
+        raise exception 'public.base_imoveis.publicacao_portais indisponivel.' using errcode = 'P0002';
+      end if;
+
+      update public.base_imoveis
+      set publicacao_portais = jsonb_set(
+        jsonb_set(coalesce(publicacao_portais, '{}'::jsonb), '{grupo_zap,tipo_crm}', to_jsonb('padrão'::text), true),
+        '{grupo_zap,tipo_slug}',
+        to_jsonb('padrao'::text),
+        true
+      )
+      where publicacao_portais -> 'grupo_zap' ->> 'publicado' = 'true'
+        and publicacao_portais -> 'grupo_zap' ->> 'tipo_crm' is null;
+
+      get diagnostics affected_count = row_count;
+
+      update public.publish_automations
+      set last_run_at = ran_at,
+          last_affected_count = affected_count,
+          updated_at = now()
+      where key = target_key;
+
+      return next;
+    end
+    $$;
+  `);
+
+  await client.query(`
+    do $$
+    begin
+      if exists (
+        select 1
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'base_imoveis'
+          and column_name = 'publicacao_portais'
+      ) then
+        drop trigger if exists ${DEFAULT_AUTOMATION_TRIGGER} on public.base_imoveis;
+
+        create trigger ${DEFAULT_AUTOMATION_TRIGGER}
+        before insert or update of publicacao_portais
+        on public.base_imoveis
+        for each row
+        execute function public.${DEFAULT_AUTOMATION_FUNCTION}();
+      end if;
+    end
+    $$;
+  `);
+
+  await client.query(`
+    do $$
+    begin
+      if exists (
+        select 1
+        from public.publish_automations
+        where key = '${DEFAULT_AUTOMATION_KEY}'
+          and active = true
+          and deleted_at is null
+          and last_run_at is null
+      ) then
+        perform *
+        from public.publish_apply_automation('${DEFAULT_AUTOMATION_KEY}');
       end if;
     end
     $$;

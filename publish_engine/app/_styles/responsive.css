@@ -34,6 +34,7 @@
     grid-template-columns: minmax(170px, 1fr) minmax(120px, 0.75fr) minmax(130px, 1fr);
   }
 
+  .portal-edit-fullscreen,
   .rule-edit-fullscreen {
     grid-template-columns: 1fr;
     grid-template-rows: auto;
@@ -44,6 +45,7 @@
     padding: 18px;
   }
 
+  .portal-edit-fullscreen .portal-config-band,
   .rule-edit-fullscreen .rule-config-band {
     grid-column: 1;
     grid-row: auto;
@@ -62,6 +64,7 @@
     padding: 22px;
   }
 
+  .portal-editor-fullscreen .portal-editor-panel,
   .rule-editor-fullscreen .portal-editor-panel {
     max-height: none;
     overflow: auto;
@@ -81,7 +84,11 @@
   }
 
   .sidebar {
+    height: auto;
+    max-height: none;
     min-height: auto;
+    overflow: visible;
+    position: static;
   }
 
   .topbar,
@@ -98,6 +105,8 @@
   .portal-row.header,
   .rule-row,
   .rule-row.header,
+  .automation-row,
+  .automation-row.header,
   .status-rule-card {
     grid-template-columns: 1fr;
     min-width: 0;
@@ -122,7 +131,8 @@
   }
 
   .portal-row.header,
-  .rule-row.header {
+  .rule-row.header,
+  .automation-row.header {
     display: none;
   }
 
@@ -153,7 +163,8 @@
   .rule-summary-heading,
   .filter-editor-heading,
   .filter-modal-heading,
-  .panel-heading {
+  .panel-heading,
+  .status-query-title-row {
     align-items: stretch;
     flex-direction: column;
   }
@@ -178,6 +189,19 @@
 
   .rule-edit-fullscreen .rule-config-main-card .rule-details-grid {
     grid-template-columns: 1fr;
+  }
+
+  .portal-edit-fullscreen .portal-identity-grid,
+  .portal-edit-fullscreen .portal-ad-type-row,
+  .portal-edit-fullscreen .portal-metrics-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .portal-edit-fullscreen .portal-identity-grid .portal-logo-uploader,
+  .portal-edit-fullscreen .portal-description-field,
+  .portal-edit-fullscreen .portal-status-toggle {
+    grid-column: auto;
+    grid-row: auto;
   }
 
   .rule-edit-fullscreen .rule-config-main-card .rule-details-grid label:nth-child(3),
